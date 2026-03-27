@@ -227,6 +227,10 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                     },
                     .websocket => |ptr| {
                         const hc: *ws.HandlerConn(WSH) = @ptrCast(@alignCast(ptr));
+                        // On Windows (blocking mode), hc.socket can become stale/zeroed
+                        // between upgradeWebsocket and this handover point. Sync from the
+                        // authoritative conn.stream.handle which remains correct.
+                        hc.socket = hc.conn.stream.handle;
                         // impossible for this to fail in blocking mode
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                         self.http_conn_pool.release(conn);
