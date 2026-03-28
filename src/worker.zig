@@ -1101,7 +1101,7 @@ fn KQueue(comptime WSH: type) type {
             _ = try posix.kevent(self.fd, &.{.{
                 .ident = @intCast(conn.getSocket()),
                 .filter = posix.system.EVFILT.READ,
-                .flags = posix.system.EV.ADD,
+                .flags = posix.system.EV.ENABLE,
                 .fflags = 0,
                 .data = 0,
                 .udata = @intFromPtr(conn),
