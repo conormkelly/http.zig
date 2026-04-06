@@ -10,7 +10,7 @@
         },
         .websocket = .{
             .url = "https://github.com/conormkelly/websocket.zig/archive/86c25138a437a7259a4ba8a2f349688eb56c040c.tar.gz",
-            .hash = "websocket-0.1.0-ZPISdZJxAwAt6Ys_JpoHQQV3NpWCof_N9Jg-Ul2g7OoV",
+            .hash = "websocket-0.1.0-ZPISdVZ_AwCQVk3jH1Z5C-O9yN18yDjYIAlEKMVUdQxN",
         },
     },
 }
