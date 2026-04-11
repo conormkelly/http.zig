@@ -429,6 +429,10 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         // the fancier management of something like HTTPConnPool for the HTTPConns
         conn_mem_pool: std.heap.MemoryPool(Conn(WSH)),
 
+        // The listening socket fd, stored so that websocketClosed() can
+        // re-enable accepting when a WebSocket connection frees a slot.
+        listener: posix.fd_t = 0,
+
         // Request and response processing may require larger buffers than the static
         // buffered of our req/res states. The BufferPool has larger pre-allocated
         // buffers that can be used and, when empty or when a larger buffer is needed,
@@ -531,6 +535,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         }
 
         pub fn run(self: *Self, listener: posix.fd_t, ready_sem: *std.Thread.Semaphore) void {
+            self.listener = listener;
             var thread_pool = &self.thread_pool;
 
             self.loop.start() catch |err| {
@@ -848,22 +853,47 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         }
 
         pub fn processWebsocketData(self: *Self, conn: *Conn(WSH), thread_buf: []u8, hc: *ws.HandlerConn(WSH)) void {
-            defer conn.releaseProcessing();
-
             var ws_conn = &hc.conn;
             const success = self.websocket.worker.dataAvailable(hc, thread_buf);
             if (success == false) {
                 ws_conn.close(.{ .code = 4997, .reason = "wsz" }) catch {};
                 self.websocket.cleanupConn(hc);
+                conn.releaseProcessing();
+                self.websocketClosed(conn);
             } else if (ws_conn.isClosed()) {
                 self.websocket.cleanupConn(hc);
+                conn.releaseProcessing();
+                self.websocketClosed(conn);
             } else {
                 self.loop.rearmRead(conn) catch |err| {
                     log.debug("({f}) failed to add read event monitor: {}", .{ ws_conn.address, err });
                     ws_conn.close(.{ .code = 4998, .reason = "wsz" }) catch {};
                     self.websocket.cleanupConn(hc);
+                    conn.releaseProcessing();
+                    self.websocketClosed(conn);
+                    return;
                 };
+                conn.releaseProcessing();
             }
+        }
+
+        /// Release a closed WebSocket connection's resources.
+        ///
+        /// During upgrade (processSignal), the HTTPConn is released and the
+        /// protocol union switches to .websocket. The regular disown() cannot
+        /// be used after this point because it accesses conn.protocol.http.
+        ///
+        /// This function handles the WebSocket-specific teardown:
+        /// removing the Conn from the handover list, decrementing the
+        /// connection counter, and returning the Conn to the memory pool.
+        ///
+        /// Must be called AFTER releaseProcessing() and cleanupConn() to
+        /// avoid use-after-free — the Conn is destroyed by this call.
+        fn websocketClosed(self: *Self, conn: *Conn(WSH)) void {
+            self.handover_list.remove(conn);
+            self.len -= 1;
+            self.conn_mem_pool.destroy(conn);
+            if (self.full) self.enableListener(self.listener);
         }
 
         fn disown(self: *Self, conn: *Conn(WSH)) void {
@@ -1102,14 +1132,16 @@ fn KQueue(comptime WSH: type) type {
 
         fn rearmRead(self: *Self, conn: *Conn(WSH)) !void {
             // called from the worker thread, can't use change_buffer
-            _ = try posix.kevent(self.fd, &.{.{
-                .ident = @intCast(conn.getSocket()),
+            // must remove then re-add for macOS
+            const socket = conn.getSocket();
+            _ = try posix.kevent(self.fd, &.{ .{
+                .ident = @intCast(socket),
                 .filter = posix.system.EVFILT.READ,
                 .flags = posix.system.EV.ENABLE,
                 .fflags = 0,
                 .data = 0,
                 .udata = @intFromPtr(conn),
-            }}, &.{}, null);
+            } }, &.{}, null);
         }
 
         fn switchToOneShot(self: *Self, conn: *Conn(WSH)) !void {
