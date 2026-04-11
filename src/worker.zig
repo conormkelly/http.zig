@@ -36,6 +36,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         buffer_pool: *BufferPool,
         http_conn_pool: HTTPConnPool,
         websocket: *ws.Worker(WSH),
+        stopping: std.atomic.Value(bool),
         timeout_request: ?Timeout,
         timeout_keepalive: ?Timeout,
         timeout_write_error: Timeout,
@@ -113,6 +114,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                 .mut = .{},
                 .server = server,
                 .config = config,
+                .stopping = std.atomic.Value(bool).init(false),
                 .connections = .{},
                 .allocator = allocator,
                 .websocket = websocket,
@@ -151,6 +153,15 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         self.websocket.shutdown();
                         break;
                     }
+                    // On Windows, stop() closes the listening socket to unblock
+                    // accept(). This produces platform-specific errors that Zig's
+                    // stdlib may not map to a distinct error code (e.g. WSAEINTR
+                    // becomes error.Unexpected). Use the stopping flag to
+                    // distinguish a clean shutdown from a genuine accept failure.
+                    if (self.stopping.load(.acquire)) {
+                        self.websocket.shutdown();
+                        break;
+                    }
                     log.err("Failed to accept socket: {}", .{err});
                     continue;
                 };
@@ -171,8 +182,12 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             thread_pool.stop();
         }
 
-        pub fn stop(self: *const Self) void {
-            // The HTTP server will stop when the http.Server shutdown the listening socket.
+        pub fn stop(self: *Self) void {
+            // Signal all threads that we're shutting down. This must be set
+            // before closing any sockets so that error handlers can distinguish
+            // shutdown-induced errors from genuine failures.
+            self.stopping.store(true, .release);
+            // The HTTP server will stop when the http.Server shuts down the listening socket.
             self.websocket.shutdown();
         }
 
@@ -266,6 +281,12 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                 const done = conn.req_state.parse(conn, reader.interface()) catch |err| {
                     switch (err) {
                         error.ReadFailed => {
+                            // If we're shutting down, the socket was closed from
+                            // the stop() thread. Return .disown so handleConnection
+                            // does not try to close the already-closed socket.
+                            if (self.stopping.load(.acquire)) {
+                                return .disown;
+                            }
                             if (reader.getError()) |e| {
                                 switch (e) {
                                     error.WouldBlock => {

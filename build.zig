@@ -55,6 +55,27 @@ pub fn build(b: *std.Build) !void {
         test_step.dependOn(&run_test.step);
     }
 
+    // Reproduction test for blocking-mode shutdown bug
+    {
+        const repro = b.addExecutable(.{
+            .name = "repro-blocking-shutdown",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/repro_blocking_shutdown.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "httpz", .module = httpz_module },
+                },
+            }),
+        });
+        b.installArtifact(repro);
+
+        const run_repro = b.addRunArtifact(repro);
+        run_repro.step.dependOn(b.getInstallStep());
+        const repro_step = b.step("repro-blocking-shutdown", "Reproduce blocking-mode shutdown hang (Windows)");
+        repro_step.dependOn(&run_repro.step);
+    }
+
     const examples = [_]struct {
         file: []const u8,
         name: []const u8,
