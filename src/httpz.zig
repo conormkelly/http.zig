@@ -2013,6 +2013,81 @@ test "websocket: stress" {
     for (&threads) |*th| th.join();
 }
 
+// Regression test: WebSocket connections must release their slot in the connection
+// counter when they close. Without proper cleanup, self.len monotonically increases
+// and after max_conn total WebSocket connections have been opened and closed
+// (cumulative, not concurrent), the worker permanently stops accepting.
+test "websocket: connection counter released on close" {
+    if (force_blocking) return; // non-blocking mode only
+
+    // Start a dedicated server with a very low max_conn to trigger the bug quickly.
+    const max_conn = 4;
+    var server = try Server(TestWebsocketHandler).init(t.allocator, .{
+        .address = .localhost(5999),
+        .workers = .{ .count = 1, .max_conn = max_conn },
+    }, TestWebsocketHandler{});
+    var router = try server.router(.{});
+    router.get("/ws", TestWebsocketHandler.upgrade, .{});
+    const listen_thread = try server.listenInNewThread();
+    defer {
+        server.stop();
+        listen_thread.join();
+        server.deinit();
+    }
+    try testing.waitForPort(5999);
+
+    // Open and close more WebSocket connections than max_conn.
+    // Each connection does a full upgrade, exchanges a message, then closes.
+    const total_connections = max_conn * 3; // 12 connections, well past the limit of 4
+    for (0..total_connections) |_| {
+        const stream = testStream(5999);
+        defer stream.close();
+
+        var writer = stream.writer(&.{});
+        const w = &writer.interface;
+        try w.writeAll("GET /ws HTTP/1.1\r\nContent-Length: 0\r\n");
+        try w.writeAll("upgrade: websocket\r\n");
+        try w.writeAll("Sec-Websocket-Version: 13\r\n");
+        try w.writeAll("Connection: upgrade\r\n");
+        try w.writeAll("Sec-Websocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+        try w.flush();
+
+        // Read the 101 upgrade response
+        var res = testReadHeader(stream);
+        defer res.deinit();
+        try t.expectEqual(101, res.status);
+
+        // Send a message and request close
+        try w.writeAll(&websocket.frameText("close"));
+        try w.flush();
+
+        // Wait for close frame from server
+        std.Thread.sleep(std.time.ns_per_ms * 10);
+    }
+
+    // Allow time for all connections to fully clean up
+    std.Thread.sleep(std.time.ns_per_ms * 50);
+
+    // Verify the server still accepts new connections by doing one more WS upgrade.
+    // Without the fix, this would hang forever because len == max_conn.
+    {
+        const stream = testStream(5999);
+        defer stream.close();
+        var writer = stream.writer(&.{});
+        const w = &writer.interface;
+        try w.writeAll("GET /ws HTTP/1.1\r\nContent-Length: 0\r\n");
+        try w.writeAll("upgrade: websocket\r\n");
+        try w.writeAll("Sec-Websocket-Version: 13\r\n");
+        try w.writeAll("Connection: upgrade\r\n");
+        try w.writeAll("Sec-Websocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+        try w.flush();
+
+        var res = testReadHeader(stream);
+        defer res.deinit();
+        try t.expectEqual(101, res.status);
+    }
+}
+
 test "ContentType: forX" {
     inline for (@typeInfo(ContentType).@"enum".fields) |field| {
         if (comptime std.mem.eql(u8, "BINARY", field.name)) continue;
