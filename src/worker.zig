@@ -166,6 +166,12 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                     continue;
                 };
                 metrics.connection();
+
+                if (!self.config.isUnixAddress()) {
+                    // Disable Nagle's algorithm to avoid 40-200ms delays on small messages.
+                    posix.setsockopt(socket, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+                }
+
                 // calls handleConnection through the server's thread_pool
                 thread_pool.spawnOne(.{ self, socket, address });
             }
