@@ -702,6 +702,12 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                     return if (err == error.WouldBlock) {} else err;
                 };
                 errdefer posix.close(socket);
+
+                if (!self.config.isUnixAddress()) {
+                    // Disable Nagle's algorithm to avoid 40-200ms delays on small messages.
+                    posix.setsockopt(socket, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+                }
+
                 metrics.connection();
 
                 const socket_flags = try posix.fcntl(socket, posix.F.GETFL, 0);
