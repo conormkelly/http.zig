@@ -1,5 +1,6 @@
 lib/
 zig-out/
+zig-pkg/
 .zig-cache/
 book_titles.txt
 tests/db*
