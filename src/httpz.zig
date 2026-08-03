@@ -357,7 +357,7 @@ pub fn Server(comptime H: type) type {
 
             const config = self.config;
 
-            const no_delay = config.isUnixAddress();
+            const is_unix_socket = config.isUnixAddress();
             const address = try config.parseAddress();
 
             const listener = blk: {
@@ -369,7 +369,7 @@ pub fn Server(comptime H: type) type {
             };
             errdefer posix.close(listener);
 
-            if (no_delay) {
+            if (is_unix_socket == false) {
                 try posix.setsockopt(listener, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
             }
 
@@ -393,7 +393,7 @@ pub fn Server(comptime H: type) type {
                 try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
             }
 
-            if (!config.isUnixAddress() and self._workers.len > 1) {
+            if (is_unix_socket == false and self._workers.len > 1) {
                 if (@hasDecl(posix.SO, "REUSEPORT_LB")) {
                     try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT_LB, &std.mem.toBytes(@as(c_int, 1)));
                 } else if (@hasDecl(posix.SO, "REUSEPORT")) {
