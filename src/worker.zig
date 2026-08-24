@@ -785,7 +785,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
 
             self.shutdownList(&self.request_list);
             self.shutdownConcurrentList(&self.active_list);
-            self.shutdownConcurrentList(&self.handover_list);
+            self.shutdownHandoverList(&self.handover_list);
             self.shutdownConcurrentList(&self.keepalive_list);
 
             self.buffer_pool.deinit();
@@ -1299,15 +1299,13 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         // `list` holds connections that collectTimedOut already detached from
         // request_list/keepalive_list, so they must not be removed from those
         // again. disown() would do exactly that, and List.remove rewrites head
-        // and tail from a node that is no longer a member.
+        // and tail from a node that is no longer a member. Hence release().
         fn closeList(self: *Self, list: List(Conn(WSH))) void {
             var conn = list.head;
             while (conn) |c| {
                 conn = c.next;
                 c.close();
-                self.len -= 1;
-                self.http_conn_pool.release(c.protocol.http);
-                self.conn_mem_pool.destroy(c);
+                self.release(c, c.protocol.http);
             }
         }
 
@@ -1317,14 +1315,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             while (conn) |c| {
                 conn = c.next;
                 const http_conn = c.protocol.http;
-                // An upgrade the event loop hasn't picked up yet waits in the
-                // handover list, but its socket already belongs to a websocket
-                // HandlerConn, whose shutdown has closed it. Closing it again
-                // fails with EBADF, or closes an unrelated socket that has
-                // since reused the number.
-                if (http_conn.handover != .websocket) {
-                    posix.close(http_conn.stream.handle);
-                }
+                posix.close(http_conn.stream.handle);
                 http_conn.deinit(allocator);
             }
         }
@@ -1333,6 +1324,28 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             list.mut.lock();
             defer list.mut.unlock();
             self.shutdownList(&list.inner);
+        }
+
+        // handover_list is the one list where we might not own the socket, so it
+        // can't use shutdownList's unconditional close.
+        fn shutdownHandoverList(self: *Self, list: *ConcurrentList(Conn(WSH))) void {
+            const allocator = self.allocator;
+            list.mut.lock();
+            defer list.mut.unlock();
+
+            var conn = list.inner.head;
+            while (conn) |c| {
+                conn = c.next;
+                const http_conn = c.protocol.http;
+                switch (http_conn.handover) {
+                    .disown, .websocket => {},
+                    .close, .unknown => posix.close(http_conn.stream.handle),
+                    // processHTTPData sends keepalive conns to keepalive_list,
+                    // they never reach handover_list.
+                    .keepalive => unreachable,
+                }
+                http_conn.deinit(allocator);
+            }
         }
 
         inline fn enableListener(self: *Self, listener: posix.fd_t) void {
