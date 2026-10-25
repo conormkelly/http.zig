@@ -261,6 +261,10 @@ pub fn Server(comptime H: type) type {
         _workers: []Worker,
         _cond: Thread.Condition,
         _listener: ?posix.socket_t,
+        // Set under _mut by listen(): started once accepting, err if it gave
+        // up. listenInNewThread waits for one of them.
+        _listen_started: bool,
+        _listen_err: ?anyerror,
         _max_request_per_connection: usize,
         _middlewares: []const Middleware(H),
         _websocket_state: websocket.server.WorkerState,
@@ -317,6 +321,8 @@ pub fn Server(comptime H: type) type {
                 ._cond = .{},
                 ._workers = workers,
                 ._listener = null,
+                ._listen_started = false,
+                ._listen_err = null,
                 ._middlewares = &.{},
                 ._middleware_registry = .{},
                 ._websocket_state = websocket_state,
@@ -345,6 +351,9 @@ pub fn Server(comptime H: type) type {
             defer self._cond.signal();
             self._mut.lock();
             errdefer self._mut.unlock();
+            // Runs before the unlock above, so a waiting listenInNewThread
+            // sees why listen() gave up (a port in use, most often).
+            errdefer |err| self._listen_err = err;
 
             const config = self.config;
 
@@ -358,6 +367,7 @@ pub fn Server(comptime H: type) type {
                 const proto = if (address.any.family == posix.AF.UNIX) @as(u32, 0) else posix.IPPROTO.TCP;
                 break :blk try posix.socket(address.any.family, sock_flags, proto);
             };
+            errdefer posix.close(listener);
 
             if (no_delay) {
                 // TODO: Broken on darwin:
@@ -396,6 +406,7 @@ pub fn Server(comptime H: type) type {
                 const thrd = try Thread.spawn(.{}, worker.Blocking(*Self, WebsocketHandler).listen, .{ &workers[0], listener });
 
                 // incase listenInNewThread was used and is waiting for us to start
+                self._listen_started = true;
                 self._cond.signal();
                 self._mut.unlock();
 
@@ -429,6 +440,7 @@ pub fn Server(comptime H: type) type {
                 }
 
                 // incase listenInNewThread was used and is waiting for us to start
+                self._listen_started = true;
                 self._cond.signal();
                 self._mut.unlock();
 
@@ -441,10 +453,21 @@ pub fn Server(comptime H: type) type {
         pub fn listenInNewThread(self: *Self) !std.Thread {
             self._mut.lock();
             defer self._mut.unlock();
+            self._listen_started = false;
+            self._listen_err = null;
             const thrd = try std.Thread.spawn(.{}, listen, .{self});
 
-            // we don't return until listen() signals us that the server is up
-            self._cond.wait(&self._mut);
+            // we don't return until listen() signals us that the server is up,
+            // or that it couldn't start
+            while (!self._listen_started and self._listen_err == null) {
+                self._cond.wait(&self._mut);
+            }
+            if (self._listen_err) |err| {
+                self._mut.unlock();
+                defer self._mut.lock();
+                thrd.join();
+                return err;
+            }
 
             return thrd;
         }
@@ -970,6 +993,19 @@ test "tests:afterAll" {
     cors_multiple_server.deinit();
 
     try t.expectEqual(false, global_test_allocator.detectLeaks());
+}
+
+test "httpz: listenInNewThread reports a port that's already taken" {
+    var first = try Server(void).init(t.allocator, .{ .address = .localhost(6996) }, {});
+    defer first.deinit();
+    const first_thread = try first.listenInNewThread();
+
+    var second = try Server(void).init(t.allocator, .{ .address = .localhost(6996) }, {});
+    defer second.deinit();
+    try t.expectError(error.AddressInUse, second.listenInNewThread());
+
+    first.stop();
+    first_thread.join();
 }
 
 test "httpz: quick shutdown" {
