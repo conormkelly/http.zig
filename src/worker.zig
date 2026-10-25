@@ -450,9 +450,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         // the fancier management of something like HTTPConnPool for the HTTPConns
         conn_mem_pool: std.heap.MemoryPool(Conn(WSH)),
 
-        // The listening socket fd, stored so that websocketClosed() can
-        // re-enable accepting when a WebSocket connection frees a slot.
-        listener: posix.fd_t = 0,
+        // Closed WebSocket connections waiting to be freed. After an upgrade a
+        // Conn is in none of the lists above, and its teardown (len, the
+        // conn_mem_pool, re-enabling the listener) is owned by the worker
+        // thread, so the thread pool queues it here and signals the loop.
+        ws_closed_list: ConcurrentList(Conn(WSH)),
 
         // Request and response processing may require larger buffers than the static
         // buffered of our req/res states. The BufferPool has larger pre-allocated
@@ -519,6 +521,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 .request_list = .{},
                 .handover_list = .{},
                 .keepalive_list = .{},
+                .ws_closed_list = .{},
                 .buffer_pool = buffer_pool,
                 .conn_mem_pool = conn_mem_pool,
                 .http_conn_pool = http_conn_pool,
@@ -556,7 +559,6 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         }
 
         pub fn run(self: *Self, listener: posix.fd_t, ready_sem: *std.Thread.Semaphore) void {
-            self.listener = listener;
             var thread_pool = &self.thread_pool;
 
             self.loop.start() catch |err| {
@@ -597,13 +599,20 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 now = timestamp(now);
                 var closed_conn = false;
 
+                // Defer signal handling (which frees handed-over and closed
+                // connections) until the whole event batch is drained. A batch
+                // can hold a .signal and a .recv for the same connection;
+                // processing the signal first would free the connection and the
+                // later .recv would dereference freed memory in getState().
+                var has_signal = false;
+
                 while (it.next()) |event| {
                     switch (event) {
                         .accept => self.accept(listener, now) catch |err| {
                             log.err("Failed to accept connection: {}", .{err});
                             std.Thread.sleep(std.time.ns_per_ms * 5);
                         },
-                        .signal => self.processSignal(&closed_conn),
+                        .signal => has_signal = true,
                         .recv => |conn| switch (conn.protocol) {
                             .http => |http_conn| {
                                 switch (http_conn.getState()) {
@@ -657,6 +666,10 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                         .shutdown => return,
                     }
                 }
+
+                // Every .recv in this batch has been handled, so it is now safe
+                // to free the connections handed over since the last batch.
+                if (has_signal) self.processSignal(&closed_conn);
 
                 const batch_size = thread_pool.batch_size;
                 if (batch_size > 0) {
@@ -761,6 +774,24 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
 
         fn processSignal(self: *Self, closed_bool: *bool) void {
             const loop = &self.loop;
+
+            {
+                var c = blk: {
+                    var wl = &self.ws_closed_list;
+                    wl.mut.lock();
+                    defer wl.mut.unlock();
+                    const head = wl.inner.head;
+                    wl.inner = .{};
+                    break :blk head;
+                };
+                while (c) |conn| {
+                    c = conn.next;
+                    closed_bool.* = true;
+                    self.len -= 1;
+                    self.conn_mem_pool.destroy(conn);
+                }
+            }
+
             var hl = &self.handover_list;
 
             // We take the handover list, and then re-initialize it. We do this
@@ -786,8 +817,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 switch (http_conn.handover) {
                     .close, .unknown => {
                         closed_bool.* = true;
-                        // http handler already closed the socket
-                        self.disown(conn);
+                        // http handler already closed the socket.
+                        // release, not disown: the snapshot above already took
+                        // conn out of handover_list, and removing it again would
+                        // splice its stale prev/next into the live list.
+                        self.release(conn, http_conn);
                     },
                     .disown => {
                         // When res.disown() was called, we immediately removed
@@ -796,14 +830,14 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                         // before we get back here.
                         // https://github.com/karlseguin/http.zig/issues/129#issuecomment-3031411404
                         closed_bool.* = true;
-                        self.disown(conn);
+                        self.release(conn, http_conn); // not disown: see .close
                     },
                     .websocket => |ptr| {
                         if (comptime WSH == httpz.DummyWebsocketHandler) {
                             std.debug.print("Your httpz handler must have a `WebsocketHandler` declaration. This must be the same type passed to `httpz.upgradeWebsocket`. Closing the connection.\n", .{});
                             closed_bool.* = true;
                             conn.close();
-                            self.disown(conn);
+                            self.release(conn, http_conn); // not disown: see .close
                             continue;
                         }
 
@@ -813,10 +847,14 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                         conn.protocol = .{ .websocket = hc };
 
                         loop.switchToOneShot(conn) catch {
+                            // conn.protocol is now .websocket, so neither disown
+                            // nor release (both read conn.protocol.http) apply.
                             metrics.internalError();
                             closed_bool.* = true;
                             conn.close();
-                            self.disown(conn);
+                            self.websocket.cleanupConn(hc);
+                            self.len -= 1;
+                            self.conn_mem_pool.destroy(conn);
                             continue;
                         };
                     },
@@ -904,17 +942,16 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         /// protocol union switches to .websocket. The regular disown() cannot
         /// be used after this point because it accesses conn.protocol.http.
         ///
-        /// This function handles the WebSocket-specific teardown:
-        /// removing the Conn from the handover list, decrementing the
-        /// connection counter, and returning the Conn to the memory pool.
+        /// Called from the thread pool. The Conn is in no list after the
+        /// upgrade, and len, conn_mem_pool and the listener belong to the
+        /// worker thread, so the Conn is queued on ws_closed_list and the
+        /// worker frees it in processSignal.
         ///
-        /// Must be called AFTER releaseProcessing() and cleanupConn() to
-        /// avoid use-after-free — the Conn is destroyed by this call.
+        /// Must be called AFTER releaseProcessing() and cleanupConn(): the
+        /// Conn may be destroyed as soon as it is queued.
         fn websocketClosed(self: *Self, conn: *Conn(WSH)) void {
-            self.handover_list.remove(conn);
-            self.len -= 1;
-            self.conn_mem_pool.destroy(conn);
-            if (self.full) self.enableListener(self.listener);
+            self.ws_closed_list.insert(conn);
+            self.loop.signal() catch |err| log.err("failed to signal worker: {}", .{err});
         }
 
         fn disown(self: *Self, conn: *Conn(WSH)) void {
@@ -925,6 +962,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 .keepalive => self.keepalive_list.remove(conn),
                 .active => unreachable,
             }
+            self.release(conn, http_conn);
+        }
+
+        /// Free a connection that is in no list.
+        fn release(self: *Self, conn: *Conn(WSH), http_conn: *HTTPConn) void {
             self.len -= 1;
             self.http_conn_pool.release(http_conn);
             self.conn_mem_pool.destroy(conn);

@@ -2021,9 +2021,10 @@ test "websocket: connection counter released on close" {
     if (force_blocking) return; // non-blocking mode only
 
     // Start a dedicated server with a very low max_conn to trigger the bug quickly.
+    // Its own port: the shared test servers keep 5992-5999 bound all run.
     const max_conn = 4;
     var server = try Server(TestWebsocketHandler).init(t.allocator, .{
-        .address = .localhost(5999),
+        .address = .localhost(5989),
         .workers = .{ .count = 1, .max_conn = max_conn },
     }, TestWebsocketHandler{});
     var router = try server.router(.{});
@@ -2034,13 +2035,13 @@ test "websocket: connection counter released on close" {
         listen_thread.join();
         server.deinit();
     }
-    try testing.waitForPort(5999);
+    try testing.waitForPort(5989);
 
     // Open and close more WebSocket connections than max_conn.
     // Each connection does a full upgrade, exchanges a message, then closes.
     const total_connections = max_conn * 3; // 12 connections, well past the limit of 4
     for (0..total_connections) |_| {
-        const stream = testStream(5999);
+        const stream = testStream(5989);
         defer stream.close();
 
         var writer = stream.writer(&.{});
@@ -2071,7 +2072,7 @@ test "websocket: connection counter released on close" {
     // Verify the server still accepts new connections by doing one more WS upgrade.
     // Without the fix, this would hang forever because len == max_conn.
     {
-        const stream = testStream(5999);
+        const stream = testStream(5989);
         defer stream.close();
         var writer = stream.writer(&.{});
         const w = &writer.interface;
