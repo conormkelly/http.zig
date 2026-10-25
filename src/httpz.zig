@@ -1166,20 +1166,27 @@ const ShutdownDisownHandler = struct {
 // Closing a socket removes it from epoll only when no other copy of it is open. A process forked from the server (a handler that
 // starts a child) holds a copy of every open socket until it execs. The server must therefore take a connection out of epoll itself
 // before it closes it: otherwise the registration outlives the connection, and its event points at the freed Conn.
-// `dup` stands in for the forked copy.
-test "httpz: a connection closed on a parse error leaves epoll while another copy of its socket is open" {
+// `dup` stands in for the forked copy. Covers the parse-error path and the keepalive timeout sweep, on one server.
+test "httpz: a closed connection leaves epoll while another copy of its socket is open" {
     const H = HeldSocketHandler;
     H.held.store(-1, .release);
 
-    var server = try Server(H).init(t.allocator, .{ .address = .localhost(5984) }, H{});
+    // The 1s keepalive doesn't affect the parse-error case: its second request arrives right after the first response.
+    var server = try Server(H).init(t.allocator, .{ .address = .localhost(5984), .timeout = .{ .keepalive = 1 } }, H{});
     const thrd = try server.listenInNewThread();
+    defer {
+        server.stop();
+        thrd.join();
+        server.deinit();
+    }
 
+    var buf: [200]u8 = undefined;
+
+    // closed on a parse error
     {
         const stream = testStream(5984);
         var writer = stream.writer(&.{});
         try writer.interface.writeAll("GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
-
-        var buf: [200]u8 = undefined;
         _ = testReadAll(stream, &buf);
         try t.expectEqual(true, H.held.load(.acquire) >= 0);
 
@@ -1189,42 +1196,24 @@ test "httpz: a connection closed on a parse error leaves epoll while another cop
 
         // The client hangs up. If the registration is still in epoll, the event for it names a connection that no longer exists.
         stream.close();
+        std.Thread.sleep(200 * std.time.ns_per_ms);
+        posix.close(H.held.swap(-1, .acq_rel));
     }
 
-    std.Thread.sleep(200 * std.time.ns_per_ms);
-    posix.close(H.held.load(.acquire));
-    server.stop();
-    thrd.join();
-    server.deinit();
-}
-
-// The same, for the sweep that closes connections whose keepalive timeout has passed.
-test "httpz: a connection closed by the keepalive timeout leaves epoll while another copy of its socket is open" {
-    const H = HeldSocketHandler;
-    H.held.store(-1, .release);
-
-    var server = try Server(H).init(t.allocator, .{ .address = .localhost(5985), .timeout = .{ .keepalive = 1 } }, H{});
-    const thrd = try server.listenInNewThread();
-
+    // closed by the keepalive timeout sweep
     {
-        const stream = testStream(5985);
+        const stream = testStream(5984);
         var writer = stream.writer(&.{});
         try writer.interface.writeAll("GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
-
-        var buf: [200]u8 = undefined;
         _ = testReadAll(stream, &buf);
         try t.expectEqual(true, H.held.load(.acquire) >= 0);
 
         // The connection idles past its keepalive timeout and the server closes its side, then the client hangs up.
         std.Thread.sleep(3500 * std.time.ns_per_ms);
         stream.close();
+        std.Thread.sleep(200 * std.time.ns_per_ms);
+        posix.close(H.held.swap(-1, .acq_rel));
     }
-
-    std.Thread.sleep(200 * std.time.ns_per_ms);
-    posix.close(H.held.load(.acquire));
-    server.stop();
-    thrd.join();
-    server.deinit();
 }
 
 const HeldSocketHandler = struct {

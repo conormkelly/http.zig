@@ -846,7 +846,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 // connections) until the whole event batch is drained. A batch
                 // can hold a .signal and a .recv for the same connection;
                 // processing the signal first would free the connection and the
-                // later .recv would dereference freed memory in getState().
+                // later .recv would dereference freed memory.
                 var has_signal = false;
 
                 while (it.next()) |event| {
@@ -938,7 +938,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 .handover => self.handover_list.remove(conn),
             }
 
-            http_conn.setState(new_state);
+            http_conn._state = new_state;
 
             switch (new_state) {
                 .active => self.active_list.insert(conn),
@@ -1965,7 +1965,6 @@ pub const HTTPConn = struct {
         nonblocking,
     };
 
-    // can be concurrently accessed, use getState
     _state: State,
 
     _mut: Thread.Mutex,
@@ -2049,10 +2048,6 @@ pub const HTTPConn = struct {
         };
     }
 
-    pub fn getState(self: *const HTTPConn) State {
-        return @atomicLoad(State, &self._state, .acquire);
-    }
-
     // swapList holds `_mut` from the moment it takes the connection out of its old list until the connection is in the new list and
     // its state is set. A state read without that lock can name a list the connection has not been put into yet, and the event
     // loop would then take it out of a list it is not in. Waiting for the lock means the state read names the list it is in.
@@ -2060,10 +2055,6 @@ pub const HTTPConn = struct {
         self._mut.lock();
         defer self._mut.unlock();
         return self._state;
-    }
-
-    pub fn setState(self: *HTTPConn, state: State) void {
-        return @atomicStore(State, &self._state, state, .release);
     }
 
     pub fn deinit(self: *HTTPConn, allocator: Allocator) void {
