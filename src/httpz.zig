@@ -395,6 +395,9 @@ pub fn Server(comptime H: type) type {
             }
 
             self._listener = listener;
+            // The errdefer above closes the socket on a later error; stop()
+            // must not close it a second time.
+            errdefer self._listener = null;
 
             var workers = self._workers;
             const allocator = self.allocator;
