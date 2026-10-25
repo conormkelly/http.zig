@@ -1163,6 +1163,45 @@ const ShutdownDisownHandler = struct {
     }
 };
 
+// The application can close a socket it disowned while the handler is still
+// running. Stopping the server then must leave that socket alone: in blocking
+// mode, listen() shuts down (or, on Windows, closes) the socket of every
+// connection whose thread is still running, and a closed socket fails with
+// EBADF, which posix treats as unreachable.
+test "httpz: stopping leaves alone a socket the application disowned and closed" {
+    const H = DisownedClosedHandler;
+    H.closed.reset();
+    H.may_finish.reset();
+
+    var server = try Server(H).init(t.allocator, .{ .address = .localhost(5986) }, H{});
+    const thrd = try server.listenInNewThread();
+
+    const stream = testStream(5986);
+    defer stream.close();
+    var writer = stream.writer(&.{});
+    try writer.interface.writeAll("GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    try H.closed.timedWait(2 * std.time.ns_per_s);
+
+    server.stop();
+    H.may_finish.set();
+    thrd.join();
+    server.deinit();
+}
+
+const DisownedClosedHandler = struct {
+    var closed: std.Thread.ResetEvent = .{};
+    var may_finish: std.Thread.ResetEvent = .{};
+
+    pub fn handle(_: DisownedClosedHandler, _: *Request, res: *Response) void {
+        const socket = res.conn.stream.handle;
+        res.disown() catch unreachable;
+        posix.close(socket);
+        closed.set();
+        // Still running, so in blocking mode the connection's thread is too.
+        may_finish.wait();
+    }
+};
+
 // Closing a socket removes it from epoll only when no other copy of it is open. A process forked from the server (a handler that
 // starts a child) holds a copy of every open socket until it execs. The server must therefore take a connection out of epoll itself
 // before it closes it: otherwise the registration outlives the connection, and its event points at the freed Conn.

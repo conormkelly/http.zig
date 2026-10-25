@@ -45,8 +45,8 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         timeout_keepalive: ?Timeout,
         timeout_write_error: Timeout,
         retain_allocated_bytes_keepalive: usize,
-        connections: List(ConnNode),
-        conn_node_pool: std.heap.MemoryPool(ConnNode),
+        connections: List(TrackedSocket),
+        conn_node_pool: std.heap.MemoryPool(TrackedSocket),
         // Connection threads running, guarded by mut.
         active: usize,
         // Signalled, under mut, whenever a connection thread finishes.
@@ -68,17 +68,6 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
 
         const ThreadRecord = struct {
             thread: Thread,
-        };
-
-        const ConnNode = struct {
-            next: ?*ConnNode,
-            prev: ?*ConnNode,
-            socket: posix.fd_t,
-            // Guarded by mut. A socket is closed once, by whichever of its
-            // thread and listen (stopping) gets there first.
-            closed: bool = false,
-            // Handed to the websocket worker, which closes it.
-            websocket: bool = false,
         };
 
         const Timeout = struct {
@@ -160,7 +149,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                 .timeout_request = timeout_request,
                 .timeout_keepalive = timeout_keepalive,
                 .timeout_write_error = Timeout.init(5),
-                .conn_node_pool = std.heap.MemoryPool(ConnNode).init(allocator),
+                .conn_node_pool = std.heap.MemoryPool(TrackedSocket).init(allocator),
                 .retain_allocated_bytes_keepalive = retain_allocated_bytes_keepalive,
             };
         }
@@ -221,13 +210,14 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                 // Windows only wakes a blocked recv by closing the socket;
                 // elsewhere shutdown does, leaving the close to the thread,
                 // so the socket's number can't be reused under it.
-                // WebSocket connections are the websocket worker's to end.
+                // A socket handed off (to the websocket worker, or disowned
+                // by the application) is its new owner's to end.
                 self.mut.lock();
                 defer self.mut.unlock();
                 var node = self.connections.head;
                 while (node) |n| {
                     node = n.next;
-                    if (n.closed or n.websocket) continue;
+                    if (n.closed or n.handed_off) continue;
                     if (builtin.os.tag == .windows) {
                         n.closed = true;
                         posix.close(n.socket);
@@ -350,6 +340,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                     .next = null,
                     .prev = null,
                     .socket = socket,
+                    .mut = &self.mut,
                 };
                 self.connections.insert(node);
                 break :blk node;
@@ -371,6 +362,8 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             conn.address = address;
             conn.handover = .unknown;
             conn.stream = .{ .handle = socket };
+            // For HTTPConn.disown; HTTPConnPool.release clears it.
+            conn.tracked = connection_node;
 
             var is_keepalive = false;
             while (true) {
@@ -392,11 +385,8 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         // between upgradeWebsocket and this handover point. Sync from the
                         // authoritative conn.stream.handle which remains correct.
                         hc.socket = hc.conn.stream.handle;
-                        {
-                            self.mut.lock();
-                            defer self.mut.unlock();
-                            connection_node.websocket = true;
-                        }
+                        // The websocket worker closes it, and ends it on stop.
+                        connection_node.handOff();
                         // impossible for this to fail in blocking mode
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                         self.http_conn_pool.release(conn);
@@ -425,7 +415,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             }
         }
 
-        fn closeSocket(self: *Self, node: *ConnNode) void {
+        fn closeSocket(self: *Self, node: *TrackedSocket) void {
             self.mut.lock();
             defer self.mut.unlock();
             if (node.closed) return;
@@ -532,6 +522,30 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         }
     };
 }
+
+// A blocking-mode connection's socket, in its worker's list of the sockets
+// whose threads are still running, so that listen() can wake those threads
+// when it stops. The fields after `socket` are guarded by `mut`, the
+// worker's, which listen() holds while it goes through the list.
+const TrackedSocket = struct {
+    next: ?*TrackedSocket,
+    prev: ?*TrackedSocket,
+    socket: posix.socket_t,
+    mut: *Thread.Mutex,
+    // A socket is closed once, by whichever of its thread and listen
+    // (stopping) gets there first.
+    closed: bool = false,
+    // Handed to a new owner (the websocket worker, or the application by
+    // disowning it), which may close it at any point: listen() must not
+    // touch it, or it could shut down or close a closed or reused socket.
+    handed_off: bool = false,
+
+    fn handOff(self: *TrackedSocket) void {
+        self.mut.lock();
+        defer self.mut.unlock();
+        self.handed_off = true;
+    }
+};
 
 // Reads a blocking-mode socket on Windows. std.net.Stream's reader there uses
 // overlapped WSARecv, which ignores SO_RCVTIMEO (so request and keepalive
@@ -1832,6 +1846,8 @@ const HTTPConnPool = struct {
     }
 
     fn release(self: *HTTPConnPool, conn: *HTTPConn) void {
+        // The next connection to use it has its own socket.
+        conn.tracked = null;
         const conns = self.conns;
 
         self.lock();
@@ -2016,6 +2032,10 @@ pub const HTTPConn = struct {
     // thread), we store the loop's FD which is more opaque.
     loop: i32,
 
+    // Blocking mode only: the socket's entry in the worker's list of open
+    // sockets, which disown() marks as handed off.
+    tracked: ?*TrackedSocket = null,
+
     fn init(allocator: Allocator, buffer_pool: *BufferPool, ws_worker: *anyopaque, loop: i32, config: *const Config) !HTTPConn {
         const conn_arena = try allocator.create(std.heap.ArenaAllocator);
         errdefer allocator.destroy(conn_arena);
@@ -2077,6 +2097,9 @@ pub const HTTPConn = struct {
         self.handover = .disown;
 
         if (comptime httpz.blockingMode()) {
+            // The new owner may close the socket at any point, so listen()
+            // must leave it alone from now on.
+            if (self.tracked) |tracked| tracked.handOff();
             return;
         }
 
