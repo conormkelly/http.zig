@@ -924,15 +924,21 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 conn.releaseProcessing();
                 self.websocketClosed(conn);
             } else {
+                // Release before re-arming. The read event is one-shot: once
+                // re-armed it can fire on another thread at once, and an
+                // event that finds the connection still marked as processing
+                // is dropped with nothing left to re-arm it, so the
+                // connection would never be read again. Nothing can fire
+                // between the release and the re-arm: the event is disarmed.
+                conn.releaseProcessing();
                 self.loop.rearmRead(conn) catch |err| {
                     log.debug("({f}) failed to add read event monitor: {}", .{ ws_conn.address, err });
+                    // Still disarmed, so no other thread can be processing it.
                     ws_conn.close(.{ .code = 4998, .reason = "wsz" }) catch {};
                     self.websocket.cleanupConn(hc);
-                    conn.releaseProcessing();
                     self.websocketClosed(conn);
                     return;
                 };
-                conn.releaseProcessing();
             }
         }
 
