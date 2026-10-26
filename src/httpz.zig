@@ -378,7 +378,25 @@ pub fn Server(comptime H: type) type {
                 try posix.setsockopt(listener, posix.IPPROTO.TCP, 1, &std.mem.toBytes(@as(c_int, 1)));
             }
 
-            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+            if (builtin.os.tag == .windows) {
+                // SO_REUSEADDR means something else on Windows: it lets a
+                // second listener bind a port one already has, so two servers
+                // (two copies of one app) silently share it and connections
+                // land on either. SO_EXCLUSIVEADDRUSE (~SO_REUSEADDR in
+                // winsock) refuses any second listener with WSAEADDRINUSE.
+                // Windows needs no option to rebind past TIME_WAIT. Set
+                // through winsock directly: as an int the option is negative,
+                // which posix.setsockopt's u32 option name can't carry.
+                const ws2_32 = std.os.windows.ws2_32;
+                const SO_EXCLUSIVEADDRUSE: i32 = ~@as(i32, ws2_32.SO.REUSEADDR);
+                const one = std.mem.toBytes(@as(c_int, 1));
+                if (ws2_32.setsockopt(listener, ws2_32.SOL.SOCKET, SO_EXCLUSIVEADDRUSE, &one, one.len) == ws2_32.SOCKET_ERROR) {
+                    log.err("Failed to set SO_EXCLUSIVEADDRUSE: {}", .{ws2_32.WSAGetLastError()});
+                    return error.Unexpected;
+                }
+            } else {
+                try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+            }
 
             if (!config.isUnixAddress() and self._workers.len > 1) {
                 if (@hasDecl(posix.SO, "REUSEPORT_LB")) {
