@@ -1073,7 +1073,8 @@ test "httpz: a connection that stays open doesn't hold up the ones after it" {
     for (0..8) |i| {
         const stream = try std.net.tcpConnectToAddress(try std.net.Address.parseIp("127.0.0.1", 6994));
         defer stream.close();
-        const timeout = std.mem.toBytes(posix.timeval{ .sec = 2, .usec = 0 });
+        // Windows takes a DWORD of milliseconds, everything else a timeval.
+        const timeout = if (builtin.os.tag == .windows) std.mem.toBytes(@as(u32, 2000)) else std.mem.toBytes(posix.timeval{ .sec = 2, .usec = 0 });
         try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
         _ = try posix.write(stream.handle, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
 

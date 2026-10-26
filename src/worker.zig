@@ -83,13 +83,19 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
 
         const Timeout = struct {
             sec: u32,
-            timeval: [@sizeOf(std.posix.timeval)]u8,
+            // SO_RCVTIMEO's value: a timeval, except on Windows, where it's a
+            // DWORD of milliseconds (a timeval there reads as its seconds
+            // field in milliseconds: 5 s would be 5 ms).
+            timeval: if (builtin.os.tag == .windows) [4]u8 else [@sizeOf(std.posix.timeval)]u8,
 
             // if sec is null, it means we want to cancel the timeout.
             fn init(sec: ?u32) Timeout {
                 return .{
                     .sec = if (sec) |s| s else MAX_TIMEOUT,
-                    .timeval = std.mem.toBytes(std.posix.timeval{ .sec = @intCast(sec orelse 0), .usec = 0 }),
+                    .timeval = if (builtin.os.tag == .windows)
+                        std.mem.toBytes(@as(u32, (sec orelse 0) *| 1000))
+                    else
+                        std.mem.toBytes(std.posix.timeval{ .sec = @intCast(sec orelse 0), .usec = 0 }),
                 };
             }
         };
@@ -427,7 +433,8 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             }
 
             var is_first = true;
-            var reader = stream.reader(&.{}); // Request.State does its own buffering
+            // Request.State does its own buffering
+            var reader = if (builtin.os.tag == .windows) RecvReader.init(stream.handle) else stream.reader(&.{});
             while (true) {
                 const done = conn.req_state.parse(conn, reader.interface()) catch |err| {
                     switch (err) {
@@ -496,7 +503,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         }
 
         fn handleWebSocket(self: *const Self, hc: *ws.HandlerConn(WSH)) !void {
-            posix.setsockopt(hc.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(posix.timeval{ .sec = 0, .usec = 0 })) catch |err| {
+            posix.setsockopt(hc.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &Timeout.init(null).timeval) catch |err| {
                 self.websocket.cleanupConn(hc);
                 return err;
             };
@@ -505,6 +512,71 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         }
     };
 }
+
+// Reads a blocking-mode socket on Windows. std.net.Stream's reader there uses
+// overlapped WSARecv, which ignores SO_RCVTIMEO (so request and keepalive
+// timeouts never fire) and treats the abort of a read pending when the socket
+// is closed (as listen does, stopping) as unreachable. Plain recv honours the
+// timeout and reports a closed socket as an error.
+const RecvReader = struct {
+    interface_state: std.Io.Reader,
+    handle: posix.socket_t,
+    error_state: ?Error,
+
+    const Error = error{ WouldBlock, NotOpenForReading, ConnectionResetByPeer, Unexpected };
+    const ws2_32 = std.os.windows.ws2_32;
+
+    fn init(handle: posix.socket_t) RecvReader {
+        return .{
+            .interface_state = .{
+                .vtable = &.{ .stream = stream, .readVec = readVec },
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+            },
+            .handle = handle,
+            .error_state = null,
+        };
+    }
+
+    fn interface(self: *RecvReader) *std.Io.Reader {
+        return &self.interface_state;
+    }
+
+    fn getError(self: *const RecvReader) ?Error {
+        return self.error_state;
+    }
+
+    fn stream(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var bufs: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &bufs);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        const self: *RecvReader = @alignCast(@fieldParentPtr("interface_state", io_r));
+        for (data) |buf| {
+            if (buf.len == 0) continue;
+            const len: i32 = @intCast(@min(buf.len, std.math.maxInt(i32)));
+            const rc = ws2_32.recv(self.handle, buf.ptr, len, 0);
+            if (rc == ws2_32.SOCKET_ERROR) {
+                self.error_state = switch (ws2_32.WSAGetLastError()) {
+                    .WSAETIMEDOUT, .WSAEWOULDBLOCK => error.WouldBlock,
+                    // Closed under us, by listen while stopping.
+                    .WSAENOTSOCK, .WSAEINTR, .WSAESHUTDOWN, .WSAECONNABORTED => error.NotOpenForReading,
+                    .WSAECONNRESET, .WSAENETRESET => error.ConnectionResetByPeer,
+                    else => error.Unexpected,
+                };
+                return error.ReadFailed;
+            }
+            if (rc == 0) return error.EndOfStream;
+            return @intCast(rc);
+        }
+        return 0;
+    }
+};
 
 // This is a NonBlocking worker. We have N workers, each accepting connections
 // and largely working in isolation from each other (the only thing they share
