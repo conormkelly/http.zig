@@ -37,6 +37,7 @@ pub const Config = struct {
         count: ?u16 = null,
         backlog: ?u32 = null,
         buffer_size: ?usize = null,
+        stack_size: ?usize = null,
     };
 
     pub const Worker = struct {
@@ -104,6 +105,12 @@ pub const Config = struct {
 
     pub fn threadPoolCount(self: *const Config) u32 {
         return self.thread_pool.count orelse 32;
+    }
+
+    // Whole pages: some platforms (macOS) refuse a stack size that isn't.
+    pub fn threadStackSize(self: *const Config) usize {
+        const size = self.thread_pool.stack_size orelse return std.Thread.SpawnConfig.default_stack_size;
+        return std.mem.alignForward(usize, size, std.heap.pageSize());
     }
 
     pub fn workerCount(self: *const Config) u32 {

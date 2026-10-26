@@ -1048,6 +1048,53 @@ test "httpz: shutdown without listen" {
     server.deinit();
 }
 
+test "httpz: a connection that stays open doesn't hold up the ones after it" {
+    // In blocking mode a connection has a thread for as long as it's open: a
+    // WebSocket client's for its whole session. Connections made meanwhile
+    // must still be answered, however few pool threads there are.
+    var server = try Server(void).init(t.allocator, .{
+        .address = .localhost(6994),
+        .thread_pool = .{ .count = 2 },
+        .workers = .{ .max_conn = 16 },
+    }, {});
+    defer server.deinit();
+    var router = try server.router(.{});
+    router.get("/", testAnswerOk, .{});
+    const thrd = try server.listenInNewThread();
+    defer {
+        server.stop();
+        thrd.join();
+    }
+
+    // Open, and silent: with no request timeout it is never let go.
+    const idle = try std.net.tcpConnectToAddress(try std.net.Address.parseIp("127.0.0.1", 6994));
+    defer idle.close();
+
+    for (0..8) |i| {
+        const stream = try std.net.tcpConnectToAddress(try std.net.Address.parseIp("127.0.0.1", 6994));
+        defer stream.close();
+        const timeout = std.mem.toBytes(posix.timeval{ .sec = 2, .usec = 0 });
+        try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
+        _ = try posix.write(stream.handle, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        while (len < buf.len) {
+            const n = posix.read(stream.handle, buf[len..]) catch |err| {
+                std.debug.print("connection {d} after the open one: {}\n", .{ i, err });
+                return err;
+            };
+            if (n == 0) break;
+            len += n;
+        }
+        try t.expectString("HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nok", buf[0..len]);
+    }
+}
+
+fn testAnswerOk(_: *Request, res: *Response) !void {
+    res.body = "ok";
+}
+
 test "httpz: invalid request" {
     const stream = testStream(5992);
     defer stream.close();

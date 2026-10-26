@@ -27,6 +27,10 @@ const MAX_TIMEOUT = 2_147_483_647;
 
 // This is our Blocking worker. It's very different than NonBlocking and much
 // simpler. (WSH is our websocket handler, and can be void)
+// Each connection gets a thread of its own for as long as it's open, up to
+// max_conn of them: a blocking connection holds its thread throughout (a
+// WebSocket for its whole session), so connections can't share threads
+// without one waiting behind another that may never end.
 pub fn Blocking(comptime S: type, comptime WSH: type) type {
     return struct {
         server: S,
@@ -43,7 +47,28 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         retain_allocated_bytes_keepalive: usize,
         connections: List(ConnNode),
         conn_node_pool: std.heap.MemoryPool(ConnNode),
-        thread_pool: ThreadPool(Self.handleConnection),
+        // Connection threads running, guarded by mut.
+        active: usize,
+        // Signalled, under mut, whenever a connection thread finishes.
+        thread_done: Thread.Condition,
+        // Set, under mut, once stop() has finished with the websocket worker:
+        // listen must not return (and the server deinit this worker) before.
+        stop_done: bool,
+        // A record per connection thread, so listen can join each one once
+        // it has finished. Joined, a thread can't still be running this
+        // library's code when the program that loaded it unloads it.
+        thread_records: std.heap.MemoryPool(ThreadRecord),
+        // Records of finished threads, still to join; guarded by mut.
+        finished_threads: std.ArrayList(*ThreadRecord),
+        max_conn: usize,
+        thread_stack_size: usize,
+        thread_buffer_size: usize,
+        // Buffers of finished connection threads, for later ones; guarded by mut.
+        spare_buffers: std.ArrayList([]u8),
+
+        const ThreadRecord = struct {
+            thread: Thread,
+        };
 
         const ConnNode = struct {
             next: ?*ConnNode,
@@ -100,16 +125,6 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
 
             const retain_allocated_bytes_keepalive = config.workers.retain_allocated_bytes orelse 8192;
 
-            var thread_pool = try ThreadPool(Self.handleConnection).init(allocator, .{
-                .count = config.threadPoolCount(),
-                .backlog = config.thread_pool.backlog orelse 500,
-                .buffer_size = config.thread_pool.buffer_size orelse 32_768,
-            });
-            errdefer {
-                thread_pool.stop();
-                thread_pool.deinit();
-            }
-
             return .{
                 .mut = .{},
                 .server = server,
@@ -119,7 +134,17 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                 .allocator = allocator,
                 .websocket = websocket,
                 .buffer_pool = buffer_pool,
-                .thread_pool = thread_pool,
+                .active = 0,
+                .thread_done = .{},
+                .stop_done = false,
+                .thread_records = std.heap.MemoryPool(ThreadRecord).init(allocator),
+                .finished_threads = .empty,
+                // Without max_conn, the limit is the thread pool's size, which
+                // it was when connections ran on that pool.
+                .max_conn = @max(1, config.workers.max_conn orelse config.threadPoolCount()),
+                .thread_stack_size = config.threadStackSize(),
+                .thread_buffer_size = config.thread_pool.buffer_size orelse 32_768,
+                .spare_buffers = .empty,
                 .http_conn_pool = http_conn_pool,
                 .timeout_request = timeout_request,
                 .timeout_keepalive = timeout_keepalive,
@@ -133,8 +158,11 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             const allocator = self.allocator;
 
             self.websocket.deinit();
-            self.thread_pool.deinit();
             allocator.destroy(self.websocket);
+            for (self.spare_buffers.items) |buf| allocator.free(buf);
+            self.spare_buffers.deinit(allocator);
+            self.finished_threads.deinit(allocator);
+            self.thread_records.deinit();
 
             self.http_conn_pool.deinit();
             self.conn_node_pool.deinit();
@@ -144,8 +172,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         }
 
         pub fn listen(self: *Self, listener: posix.socket_t) void {
-            var thread_pool = &self.thread_pool;
-            while (true) {
+            while (self.waitForThreadSlot()) {
                 var address: net.Address = undefined;
                 var address_len: posix.socklen_t = @sizeOf(net.Address);
                 const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
@@ -166,8 +193,10 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                     continue;
                 };
                 metrics.connection();
-                // calls handleConnection through the server's thread_pool
-                thread_pool.spawnOne(.{ self, socket, address });
+                self.startConnectionThread(socket, address) catch |err| {
+                    log.err("Failed to start a thread for a connection: {}", .{err});
+                    posix.close(socket);
+                };
             }
 
             {
@@ -179,7 +208,82 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                     posix.close(n.socket);
                 }
             }
-            thread_pool.stop();
+
+            // Closing their sockets ends every connection; deinit must wait
+            // until every connection thread has exited, and until stop() (if
+            // it's what ended the loop) is done with this worker.
+            self.mut.lock();
+            defer self.mut.unlock();
+            while (self.active > 0 or (self.stopping.load(.acquire) and !self.stop_done)) {
+                self.thread_done.wait(&self.mut);
+            }
+            self.joinFinishedThreads();
+        }
+
+        // At max_conn, waits for a connection to end before accepting another,
+        // so new ones wait in the listen backlog, as with a full NonBlocking
+        // worker. False once stop() has finished; until then, accept is what
+        // ends listen, when stop() closes the listener.
+        fn waitForThreadSlot(self: *Self) bool {
+            self.mut.lock();
+            defer self.mut.unlock();
+            while (true) {
+                self.joinFinishedThreads();
+                if (self.stop_done) return false;
+                if (self.active < self.max_conn) return true;
+                self.thread_done.wait(&self.mut);
+            }
+        }
+
+        // Under mut. A finished thread has pushed its record and released
+        // mut for the last time, so joining it here can't deadlock.
+        fn joinFinishedThreads(self: *Self) void {
+            for (self.finished_threads.items) |record| {
+                record.thread.join();
+                self.thread_records.destroy(record);
+            }
+            self.finished_threads.clearRetainingCapacity();
+        }
+
+        fn startConnectionThread(self: *Self, socket: posix.socket_t, address: net.Address) !void {
+            // Under mut until the record holds the thread, so the thread
+            // can't finish (and be joined) before then.
+            self.mut.lock();
+            defer self.mut.unlock();
+            const record = try self.thread_records.create();
+            errdefer self.thread_records.destroy(record);
+            // Room for every unjoined thread's record, so a finishing thread
+            // can always list itself without allocating.
+            try self.finished_threads.ensureTotalCapacity(self.allocator, self.active + 1 + self.finished_threads.items.len);
+            record.thread = try Thread.spawn(.{ .stack_size = self.thread_stack_size }, Self.connectionThread, .{ self, socket, address, record });
+            self.active += 1;
+        }
+
+        fn threadDone(self: *Self, record: *ThreadRecord) void {
+            self.mut.lock();
+            defer self.mut.unlock();
+            self.active -= 1;
+            self.finished_threads.appendAssumeCapacity(record);
+            self.thread_done.broadcast();
+        }
+
+        fn connectionThread(self: *Self, socket: posix.socket_t, address: net.Address, record: *ThreadRecord) void {
+            defer self.threadDone(record);
+            const buf = blk: {
+                self.mut.lock();
+                defer self.mut.unlock();
+                break :blk self.spare_buffers.pop() orelse self.allocator.alloc(u8, self.thread_buffer_size) catch |err| {
+                    log.err("Failed to allocate a connection's thread buffer: {}", .{err});
+                    posix.close(socket);
+                    return;
+                };
+            };
+            defer {
+                self.mut.lock();
+                defer self.mut.unlock();
+                self.spare_buffers.append(self.allocator, buf) catch self.allocator.free(buf);
+            }
+            self.handleConnection(socket, address, buf);
         }
 
         pub fn stop(self: *Self) void {
@@ -189,16 +293,29 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             self.stopping.store(true, .release);
             // The HTTP server will stop when the http.Server shuts down the listening socket.
             self.websocket.shutdown();
+            // Last: once listen sees this it may return, and the server then
+            // deinits this worker. mut itself lives until the server's deinit.
+            self.mut.lock();
+            defer self.mut.unlock();
+            self.stop_done = true;
+            self.thread_done.broadcast();
         }
 
-        // Called in a worker thread. `thread_buf` is a thread-specific buffer that
-        // we are free to use as needed.
-        pub fn handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, thread_buf: []u8) void {
+        // Called on the connection's own thread. `thread_buf` is that thread's
+        // buffer, which we are free to use as needed.
+        fn handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, thread_buf: []u8) void {
             const connection_node = blk: {
                 self.mut.lock();
                 defer self.mut.unlock();
+                // listen closes the sockets of listed connections when it
+                // stops; one accepted just before then isn't listed yet.
+                if (self.stopping.load(.acquire)) {
+                    posix.close(socket);
+                    return;
+                }
                 const node = self.conn_node_pool.create() catch |err| {
                     log.err("Failed to initialize connection node: {}", .{err});
+                    posix.close(socket);
                     return;
                 };
                 node.* = .{
@@ -501,6 +618,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 .count = config.threadPoolCount(),
                 .backlog = config.thread_pool.backlog orelse 500,
                 .buffer_size = config.thread_pool.buffer_size orelse 32_768,
+                .stack_size = config.threadStackSize(),
             });
 
             errdefer {
