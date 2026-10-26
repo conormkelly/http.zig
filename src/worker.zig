@@ -460,7 +460,13 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                                         // won't close it again.
                                         return .close;
                                     },
-                                    else => {},
+                                    // The reader's own error, not ReadFailed: a client
+                                    // resetting its connection (a browser closing a tab)
+                                    // is no server error, and requestError knows that.
+                                    else => |read_err| {
+                                        requestError(conn, read_err) catch {};
+                                        return .close;
+                                    },
                                 }
                             }
                         },
