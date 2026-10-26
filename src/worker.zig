@@ -74,6 +74,11 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             next: ?*ConnNode,
             prev: ?*ConnNode,
             socket: posix.fd_t,
+            // Guarded by mut. A socket is closed once, by whichever of its
+            // thread and listen (stopping) gets there first.
+            closed: bool = false,
+            // Handed to the websocket worker, which closes it.
+            websocket: bool = false,
         };
 
         const Timeout = struct {
@@ -200,12 +205,23 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             }
 
             {
+                // Wake every connection thread still blocked on its socket.
+                // Windows only wakes a blocked recv by closing the socket;
+                // elsewhere shutdown does, leaving the close to the thread,
+                // so the socket's number can't be reused under it.
+                // WebSocket connections are the websocket worker's to end.
                 self.mut.lock();
                 defer self.mut.unlock();
                 var node = self.connections.head;
                 while (node) |n| {
                     node = n.next;
-                    posix.close(n.socket);
+                    if (n.closed or n.websocket) continue;
+                    if (builtin.os.tag == .windows) {
+                        n.closed = true;
+                        posix.close(n.socket);
+                    } else {
+                        posix.shutdown(n.socket, .both) catch {};
+                    }
                 }
             }
 
@@ -336,6 +352,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
 
             var conn = self.http_conn_pool.acquire() catch |err| {
                 log.err("Failed to initialize connection: {}", .{err});
+                self.closeSocket(connection_node);
                 return;
             };
 
@@ -351,7 +368,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                     },
                     .close, .unknown => {
-                        posix.close(socket);
+                        self.closeSocket(connection_node);
                         // impossible for this to fail in blocking mode
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                         self.http_conn_pool.release(conn);
@@ -363,6 +380,11 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         // between upgradeWebsocket and this handover point. Sync from the
                         // authoritative conn.stream.handle which remains correct.
                         hc.socket = hc.conn.stream.handle;
+                        {
+                            self.mut.lock();
+                            defer self.mut.unlock();
+                            connection_node.websocket = true;
+                        }
                         // impossible for this to fail in blocking mode
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                         self.http_conn_pool.release(conn);
@@ -381,6 +403,14 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                     },
                 }
             }
+        }
+
+        fn closeSocket(self: *Self, node: *ConnNode) void {
+            self.mut.lock();
+            defer self.mut.unlock();
+            if (node.closed) return;
+            node.closed = true;
+            posix.close(node.socket);
         }
 
         fn handleRequest(self: *const Self, conn: *HTTPConn, is_keepalive: bool, thread_buf: []u8) !HTTPConn.Handover {
@@ -402,11 +432,11 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                 const done = conn.req_state.parse(conn, reader.interface()) catch |err| {
                     switch (err) {
                         error.ReadFailed => {
-                            // If we're shutting down, the socket was closed from
-                            // the stop() thread. Return .disown so handleConnection
-                            // does not try to close the already-closed socket.
+                            // Shutting down: listen woke us by closing or
+                            // shutting down the socket. .close closes it if
+                            // listen hasn't.
                             if (self.stopping.load(.acquire)) {
-                                return .disown;
+                                return .close;
                             }
                             if (reader.getError()) |e| {
                                 switch (e) {
@@ -419,14 +449,9 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                                         return .close;
                                     },
                                     error.NotOpenForReading => {
-                                        // This can only happen when we're shutting down and our
-                                        // listener has called posix.close(socket) to unblock
-                                        // this thread. Using `.disown` is a bit of a hack, but
-                                        // disown is handled in handleConnection the way we want
-                                        // WE DO NOT WANT to return .close, else that would result
-                                        // in posix.close(socket) being called on an already-closed
-                                        // socket, which would panic.
-                                        return .disown;
+                                        // listen closed the socket while stopping; .close
+                                        // won't close it again.
+                                        return .close;
                                     },
                                     else => {},
                                 }
@@ -435,8 +460,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         else => {},
                     }
                     requestError(conn, err) catch {};
-                    posix.close(stream.handle);
-                    return .disown;
+                    return .close;
                 };
 
                 if (done) {
