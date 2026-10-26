@@ -463,6 +463,10 @@ pub fn Server(comptime H: type) type {
                 for (threads) |thrd| {
                     thrd.join();
                 }
+
+                // Closed here rather than in stop(): until its thread exits, a
+                // worker can still re-arm the listener in its event loop.
+                posix.close(listener);
             }
         }
 
@@ -501,15 +505,17 @@ pub fn Server(comptime H: type) type {
                 w.stop();
             }
 
-            if (self._listener) |l| {
-                if (comptime blockingMode()) {
+            if (comptime blockingMode()) {
+                if (self._listener) |l| {
                     // necessary to unblock accept on linux
                     // (which might not be that necessary since, on Linux,
                     // NonBlocking should be used)
                     posix.shutdown(l, .recv) catch {};
+                    posix.close(l);
                 }
-                posix.close(l);
             }
+            // In nonblocking mode, listen() closes the listener once its
+            // workers have exited.
         }
 
         pub fn router(self: *Self, config: RouterConfig) !*Router(H, ActionArg) {
