@@ -4,9 +4,13 @@
 //    .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
 // });
 
-pub const std_options = std.Options{ .log_scope_levels = &[_]std.log.ScopeLevel{
-    .{ .scope = .websocket, .level = .warn },
-} };
+pub const std_options = std.Options{
+    .log_scope_levels = &[_]std.log.ScopeLevel{
+        .{ .scope = .websocket, .level = .warn },
+    },
+    // main() ignores SIGPIPE itself; see ignoreSigpipe.
+    .keep_sigpipe = true,
+};
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -19,6 +23,8 @@ const BORDER = "=" ** 80;
 var current_test: ?[]const u8 = null;
 
 pub fn main() !void {
+    ignoreSigpipe();
+
     var mem: [8192]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&mem);
 
@@ -135,6 +141,24 @@ pub fn main() !void {
     try slowest.display();
     Printer.fmt("\n", .{});
     std.posix.exit(if (fail == 0) 0 else 1);
+}
+
+// The tests run servers and clients in this one process, so a server writing
+// to a client that has hung up raises SIGPIPE here. Zig's start code handles
+// it with a no-op handler installed without SA_RESTART, so the signal
+// interrupts whatever blocking call another test thread is in with EINTR.
+// std.posix.connect retries a connect interrupted that way, and on macOS the
+// retry finds the socket already connected: EISCONN, which it treats as
+// unreachable. Ignoring the signal means it never interrupts anything; the
+// failed write still returns EPIPE.
+fn ignoreSigpipe() void {
+    if (builtin.os.tag == .windows) return;
+    const posix = std.posix;
+    posix.sigaction(posix.SIG.PIPE, &.{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    }, null);
 }
 
 const Printer = struct {
