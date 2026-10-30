@@ -1285,7 +1285,14 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             while (conn) |c| {
                 conn = c.next;
                 const http_conn = c.protocol.http;
-                posix.close(http_conn.stream.handle);
+                // An upgrade the event loop hasn't picked up yet waits in the
+                // handover list, but its socket already belongs to a websocket
+                // HandlerConn, whose shutdown has closed it. Closing it again
+                // fails with EBADF, or closes an unrelated socket that has
+                // since reused the number.
+                if (http_conn.handover != .websocket) {
+                    posix.close(http_conn.stream.handle);
+                }
                 http_conn.deinit(allocator);
             }
         }
