@@ -403,7 +403,15 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         // blocking read loop
                         // will close the connection
                         self.handleWebSocket(hc) catch |err| {
-                            log.err("({f} websocket connection error: {}", .{ address, err });
+                            // Shutdown ends a connection by closing its socket,
+                            // so on Windows a read that starts after the close
+                            // fails (WSAENOTSOCK). That's the connection ending
+                            // as asked, not a server error.
+                            if (self.stopping.load(.acquire)) {
+                                log.debug("({f} websocket connection ended by shutdown: {}", .{ address, err });
+                            } else {
+                                log.err("({f} websocket connection error: {}", .{ address, err });
+                            }
                         };
                         return;
                     },
