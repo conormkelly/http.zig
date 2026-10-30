@@ -27,6 +27,10 @@ const MAX_TIMEOUT = 2_147_483_647;
 
 // This is our Blocking worker. It's very different than NonBlocking and much
 // simpler. (WSH is our websocket handler, and can be void)
+// Each connection gets a thread of its own for as long as it's open, up to
+// max_conn of them: a blocking connection holds its thread throughout (a
+// WebSocket for its whole session), so connections can't share threads
+// without one waiting behind another that may never end.
 pub fn Blocking(comptime S: type, comptime WSH: type) type {
     return struct {
         server: S,
@@ -43,23 +47,55 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         retain_allocated_bytes_keepalive: usize,
         connections: List(ConnNode),
         conn_node_pool: std.heap.MemoryPool(ConnNode),
-        thread_pool: ThreadPool(Self.handleConnection),
+        // Connection threads running, guarded by mut.
+        active: usize,
+        // Signalled, under mut, whenever a connection thread finishes.
+        thread_done: Thread.Condition,
+        // Set, under mut, once stop() has finished with the websocket worker:
+        // listen must not return (and the server deinit this worker) before.
+        stop_done: bool,
+        // A record per connection thread, so listen can join each one once
+        // it has finished. Joined, a thread can't still be running this
+        // library's code when the program that loaded it unloads it.
+        thread_records: std.heap.MemoryPool(ThreadRecord),
+        // Records of finished threads, still to join; guarded by mut.
+        finished_threads: std.ArrayList(*ThreadRecord),
+        max_conn: usize,
+        thread_stack_size: usize,
+        thread_buffer_size: usize,
+        // Buffers of finished connection threads, for later ones; guarded by mut.
+        spare_buffers: std.ArrayList([]u8),
+
+        const ThreadRecord = struct {
+            thread: Thread,
+        };
 
         const ConnNode = struct {
             next: ?*ConnNode,
             prev: ?*ConnNode,
             socket: posix.fd_t,
+            // Guarded by mut. A socket is closed once, by whichever of its
+            // thread and listen (stopping) gets there first.
+            closed: bool = false,
+            // Handed to the websocket worker, which closes it.
+            websocket: bool = false,
         };
 
         const Timeout = struct {
             sec: u32,
-            timeval: [@sizeOf(std.posix.timeval)]u8,
+            // SO_RCVTIMEO's value: a timeval, except on Windows, where it's a
+            // DWORD of milliseconds (a timeval there reads as its seconds
+            // field in milliseconds: 5 s would be 5 ms).
+            timeval: if (builtin.os.tag == .windows) [4]u8 else [@sizeOf(std.posix.timeval)]u8,
 
             // if sec is null, it means we want to cancel the timeout.
             fn init(sec: ?u32) Timeout {
                 return .{
                     .sec = if (sec) |s| s else MAX_TIMEOUT,
-                    .timeval = std.mem.toBytes(std.posix.timeval{ .sec = @intCast(sec orelse 0), .usec = 0 }),
+                    .timeval = if (builtin.os.tag == .windows)
+                        std.mem.toBytes(@as(u32, (sec orelse 0) *| 1000))
+                    else
+                        std.mem.toBytes(std.posix.timeval{ .sec = @intCast(sec orelse 0), .usec = 0 }),
                 };
             }
         };
@@ -100,16 +136,6 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
 
             const retain_allocated_bytes_keepalive = config.workers.retain_allocated_bytes orelse 8192;
 
-            var thread_pool = try ThreadPool(Self.handleConnection).init(allocator, .{
-                .count = config.threadPoolCount(),
-                .backlog = config.thread_pool.backlog orelse 500,
-                .buffer_size = config.thread_pool.buffer_size orelse 32_768,
-            });
-            errdefer {
-                thread_pool.stop();
-                thread_pool.deinit();
-            }
-
             return .{
                 .mut = .{},
                 .server = server,
@@ -119,7 +145,17 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                 .allocator = allocator,
                 .websocket = websocket,
                 .buffer_pool = buffer_pool,
-                .thread_pool = thread_pool,
+                .active = 0,
+                .thread_done = .{},
+                .stop_done = false,
+                .thread_records = std.heap.MemoryPool(ThreadRecord).init(allocator),
+                .finished_threads = .empty,
+                // Without max_conn, the limit is the thread pool's size, which
+                // it was when connections ran on that pool.
+                .max_conn = @max(1, config.workers.max_conn orelse config.threadPoolCount()),
+                .thread_stack_size = config.threadStackSize(),
+                .thread_buffer_size = config.thread_pool.buffer_size orelse 32_768,
+                .spare_buffers = .empty,
                 .http_conn_pool = http_conn_pool,
                 .timeout_request = timeout_request,
                 .timeout_keepalive = timeout_keepalive,
@@ -133,8 +169,11 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             const allocator = self.allocator;
 
             self.websocket.deinit();
-            self.thread_pool.deinit();
             allocator.destroy(self.websocket);
+            for (self.spare_buffers.items) |buf| allocator.free(buf);
+            self.spare_buffers.deinit(allocator);
+            self.finished_threads.deinit(allocator);
+            self.thread_records.deinit();
 
             self.http_conn_pool.deinit();
             self.conn_node_pool.deinit();
@@ -144,8 +183,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         }
 
         pub fn listen(self: *Self, listener: posix.socket_t) void {
-            var thread_pool = &self.thread_pool;
-            while (true) {
+            while (self.waitForThreadSlot()) {
                 var address: net.Address = undefined;
                 var address_len: posix.socklen_t = @sizeOf(net.Address);
                 const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch |err| {
@@ -172,20 +210,108 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                     posix.setsockopt(socket, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
                 }
 
-                // calls handleConnection through the server's thread_pool
-                thread_pool.spawnOne(.{ self, socket, address });
+                self.startConnectionThread(socket, address) catch |err| {
+                    log.err("Failed to start a thread for a connection: {}", .{err});
+                    posix.close(socket);
+                };
             }
 
             {
+                // Wake every connection thread still blocked on its socket.
+                // Windows only wakes a blocked recv by closing the socket;
+                // elsewhere shutdown does, leaving the close to the thread,
+                // so the socket's number can't be reused under it.
+                // WebSocket connections are the websocket worker's to end.
                 self.mut.lock();
                 defer self.mut.unlock();
                 var node = self.connections.head;
                 while (node) |n| {
                     node = n.next;
-                    posix.close(n.socket);
+                    if (n.closed or n.websocket) continue;
+                    if (builtin.os.tag == .windows) {
+                        n.closed = true;
+                        posix.close(n.socket);
+                    } else {
+                        posix.shutdown(n.socket, .both) catch {};
+                    }
                 }
             }
-            thread_pool.stop();
+
+            // Closing their sockets ends every connection; deinit must wait
+            // until every connection thread has exited, and until stop() (if
+            // it's what ended the loop) is done with this worker.
+            self.mut.lock();
+            defer self.mut.unlock();
+            while (self.active > 0 or (self.stopping.load(.acquire) and !self.stop_done)) {
+                self.thread_done.wait(&self.mut);
+            }
+            self.joinFinishedThreads();
+        }
+
+        // At max_conn, waits for a connection to end before accepting another,
+        // so new ones wait in the listen backlog, as with a full NonBlocking
+        // worker. False once stop() has finished; until then, accept is what
+        // ends listen, when stop() closes the listener.
+        fn waitForThreadSlot(self: *Self) bool {
+            self.mut.lock();
+            defer self.mut.unlock();
+            while (true) {
+                self.joinFinishedThreads();
+                if (self.stop_done) return false;
+                if (self.active < self.max_conn) return true;
+                self.thread_done.wait(&self.mut);
+            }
+        }
+
+        // Under mut. A finished thread has pushed its record and released
+        // mut for the last time, so joining it here can't deadlock.
+        fn joinFinishedThreads(self: *Self) void {
+            for (self.finished_threads.items) |record| {
+                record.thread.join();
+                self.thread_records.destroy(record);
+            }
+            self.finished_threads.clearRetainingCapacity();
+        }
+
+        fn startConnectionThread(self: *Self, socket: posix.socket_t, address: net.Address) !void {
+            // Under mut until the record holds the thread, so the thread
+            // can't finish (and be joined) before then.
+            self.mut.lock();
+            defer self.mut.unlock();
+            const record = try self.thread_records.create();
+            errdefer self.thread_records.destroy(record);
+            // Room for every unjoined thread's record, so a finishing thread
+            // can always list itself without allocating.
+            try self.finished_threads.ensureTotalCapacity(self.allocator, self.active + 1 + self.finished_threads.items.len);
+            record.thread = try Thread.spawn(.{ .stack_size = self.thread_stack_size }, Self.connectionThread, .{ self, socket, address, record });
+            self.active += 1;
+        }
+
+        fn threadDone(self: *Self, record: *ThreadRecord) void {
+            self.mut.lock();
+            defer self.mut.unlock();
+            self.active -= 1;
+            self.finished_threads.appendAssumeCapacity(record);
+            self.thread_done.broadcast();
+        }
+
+        fn connectionThread(self: *Self, socket: posix.socket_t, address: net.Address, record: *ThreadRecord) void {
+            defer self.threadDone(record);
+            const buf = blk: {
+                self.mut.lock();
+                defer self.mut.unlock();
+                break :blk self.spare_buffers.pop() orelse self.allocator.alloc(u8, self.thread_buffer_size) catch |err| {
+                    log.err("Failed to allocate a connection's thread buffer: {}", .{err});
+                    posix.close(socket);
+                    return;
+                };
+            };
+            defer {
+                self.mut.lock();
+                defer self.mut.unlock();
+                self.spare_buffers.append(self.allocator, buf) catch self.allocator.free(buf);
+            }
+            self.handleConnection(socket, address, buf);
         }
 
         pub fn stop(self: *Self) void {
@@ -195,16 +321,29 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             self.stopping.store(true, .release);
             // The HTTP server will stop when the http.Server shuts down the listening socket.
             self.websocket.shutdown();
+            // Last: once listen sees this it may return, and the server then
+            // deinits this worker. mut itself lives until the server's deinit.
+            self.mut.lock();
+            defer self.mut.unlock();
+            self.stop_done = true;
+            self.thread_done.broadcast();
         }
 
-        // Called in a worker thread. `thread_buf` is a thread-specific buffer that
-        // we are free to use as needed.
-        pub fn handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, thread_buf: []u8) void {
+        // Called on the connection's own thread. `thread_buf` is that thread's
+        // buffer, which we are free to use as needed.
+        fn handleConnection(self: *Self, socket: posix.socket_t, address: net.Address, thread_buf: []u8) void {
             const connection_node = blk: {
                 self.mut.lock();
                 defer self.mut.unlock();
+                // listen closes the sockets of listed connections when it
+                // stops; one accepted just before then isn't listed yet.
+                if (self.stopping.load(.acquire)) {
+                    posix.close(socket);
+                    return;
+                }
                 const node = self.conn_node_pool.create() catch |err| {
                     log.err("Failed to initialize connection node: {}", .{err});
+                    posix.close(socket);
                     return;
                 };
                 node.* = .{
@@ -225,6 +364,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
 
             var conn = self.http_conn_pool.acquire() catch |err| {
                 log.err("Failed to initialize connection: {}", .{err});
+                self.closeSocket(connection_node);
                 return;
             };
 
@@ -240,7 +380,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                     },
                     .close, .unknown => {
-                        posix.close(socket);
+                        self.closeSocket(connection_node);
                         // impossible for this to fail in blocking mode
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                         self.http_conn_pool.release(conn);
@@ -252,6 +392,11 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         // between upgradeWebsocket and this handover point. Sync from the
                         // authoritative conn.stream.handle which remains correct.
                         hc.socket = hc.conn.stream.handle;
+                        {
+                            self.mut.lock();
+                            defer self.mut.unlock();
+                            connection_node.websocket = true;
+                        }
                         // impossible for this to fail in blocking mode
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                         self.http_conn_pool.release(conn);
@@ -272,6 +417,14 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             }
         }
 
+        fn closeSocket(self: *Self, node: *ConnNode) void {
+            self.mut.lock();
+            defer self.mut.unlock();
+            if (node.closed) return;
+            node.closed = true;
+            posix.close(node.socket);
+        }
+
         fn handleRequest(self: *const Self, conn: *HTTPConn, is_keepalive: bool, thread_buf: []u8) !HTTPConn.Handover {
             const stream = conn.stream;
             const timeout: ?Timeout = if (is_keepalive) self.timeout_keepalive else self.timeout_request;
@@ -286,16 +439,17 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             }
 
             var is_first = true;
-            var reader = stream.reader(&.{}); // Request.State does its own buffering
+            // Request.State does its own buffering
+            var reader = if (builtin.os.tag == .windows) RecvReader.init(stream.handle) else stream.reader(&.{});
             while (true) {
                 const done = conn.req_state.parse(conn, reader.interface()) catch |err| {
                     switch (err) {
                         error.ReadFailed => {
-                            // If we're shutting down, the socket was closed from
-                            // the stop() thread. Return .disown so handleConnection
-                            // does not try to close the already-closed socket.
+                            // Shutting down: listen woke us by closing or
+                            // shutting down the socket. .close closes it if
+                            // listen hasn't.
                             if (self.stopping.load(.acquire)) {
-                                return .disown;
+                                return .close;
                             }
                             if (reader.getError()) |e| {
                                 switch (e) {
@@ -308,24 +462,24 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                                         return .close;
                                     },
                                     error.NotOpenForReading => {
-                                        // This can only happen when we're shutting down and our
-                                        // listener has called posix.close(socket) to unblock
-                                        // this thread. Using `.disown` is a bit of a hack, but
-                                        // disown is handled in handleConnection the way we want
-                                        // WE DO NOT WANT to return .close, else that would result
-                                        // in posix.close(socket) being called on an already-closed
-                                        // socket, which would panic.
-                                        return .disown;
+                                        // listen closed the socket while stopping; .close
+                                        // won't close it again.
+                                        return .close;
                                     },
-                                    else => {},
+                                    // The reader's own error, not ReadFailed: a client
+                                    // resetting its connection (a browser closing a tab)
+                                    // is no server error, and requestError knows that.
+                                    else => |read_err| {
+                                        requestError(conn, read_err) catch {};
+                                        return .close;
+                                    },
                                 }
                             }
                         },
                         else => {},
                     }
                     requestError(conn, err) catch {};
-                    posix.close(stream.handle);
-                    return .disown;
+                    return .close;
                 };
 
                 if (done) {
@@ -361,7 +515,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         }
 
         fn handleWebSocket(self: *const Self, hc: *ws.HandlerConn(WSH)) !void {
-            posix.setsockopt(hc.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(posix.timeval{ .sec = 0, .usec = 0 })) catch |err| {
+            posix.setsockopt(hc.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &Timeout.init(null).timeval) catch |err| {
                 self.websocket.cleanupConn(hc);
                 return err;
             };
@@ -370,6 +524,71 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
         }
     };
 }
+
+// Reads a blocking-mode socket on Windows. std.net.Stream's reader there uses
+// overlapped WSARecv, which ignores SO_RCVTIMEO (so request and keepalive
+// timeouts never fire) and treats the abort of a read pending when the socket
+// is closed (as listen does, stopping) as unreachable. Plain recv honours the
+// timeout and reports a closed socket as an error.
+const RecvReader = struct {
+    interface_state: std.Io.Reader,
+    handle: posix.socket_t,
+    error_state: ?Error,
+
+    const Error = error{ WouldBlock, NotOpenForReading, ConnectionResetByPeer, Unexpected };
+    const ws2_32 = std.os.windows.ws2_32;
+
+    fn init(handle: posix.socket_t) RecvReader {
+        return .{
+            .interface_state = .{
+                .vtable = &.{ .stream = stream, .readVec = readVec },
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+            },
+            .handle = handle,
+            .error_state = null,
+        };
+    }
+
+    fn interface(self: *RecvReader) *std.Io.Reader {
+        return &self.interface_state;
+    }
+
+    fn getError(self: *const RecvReader) ?Error {
+        return self.error_state;
+    }
+
+    fn stream(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var bufs: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &bufs);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        const self: *RecvReader = @alignCast(@fieldParentPtr("interface_state", io_r));
+        for (data) |buf| {
+            if (buf.len == 0) continue;
+            const len: i32 = @intCast(@min(buf.len, std.math.maxInt(i32)));
+            const rc = ws2_32.recv(self.handle, buf.ptr, len, 0);
+            if (rc == ws2_32.SOCKET_ERROR) {
+                self.error_state = switch (ws2_32.WSAGetLastError()) {
+                    .WSAETIMEDOUT, .WSAEWOULDBLOCK => error.WouldBlock,
+                    // Closed under us, by listen while stopping.
+                    .WSAENOTSOCK, .WSAEINTR, .WSAESHUTDOWN, .WSAECONNABORTED => error.NotOpenForReading,
+                    .WSAECONNRESET, .WSAENETRESET => error.ConnectionResetByPeer,
+                    else => error.Unexpected,
+                };
+                return error.ReadFailed;
+            }
+            if (rc == 0) return error.EndOfStream;
+            return @intCast(rc);
+        }
+        return 0;
+    }
+};
 
 // This is a NonBlocking worker. We have N workers, each accepting connections
 // and largely working in isolation from each other (the only thing they share
@@ -456,9 +675,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         // the fancier management of something like HTTPConnPool for the HTTPConns
         conn_mem_pool: std.heap.MemoryPool(Conn(WSH)),
 
-        // The listening socket fd, stored so that websocketClosed() can
-        // re-enable accepting when a WebSocket connection frees a slot.
-        listener: posix.fd_t = 0,
+        // Closed WebSocket connections waiting to be freed. After an upgrade a
+        // Conn is in none of the lists above, and its teardown (len, the
+        // conn_mem_pool, re-enabling the listener) is owned by the worker
+        // thread, so the thread pool queues it here and signals the loop.
+        ws_closed_list: ConcurrentList(Conn(WSH)),
 
         // Request and response processing may require larger buffers than the static
         // buffered of our req/res states. The BufferPool has larger pre-allocated
@@ -505,6 +726,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 .count = config.threadPoolCount(),
                 .backlog = config.thread_pool.backlog orelse 500,
                 .buffer_size = config.thread_pool.buffer_size orelse 32_768,
+                .stack_size = config.threadStackSize(),
             });
 
             errdefer {
@@ -525,6 +747,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 .request_list = .{},
                 .handover_list = .{},
                 .keepalive_list = .{},
+                .ws_closed_list = .{},
                 .buffer_pool = buffer_pool,
                 .conn_mem_pool = conn_mem_pool,
                 .http_conn_pool = http_conn_pool,
@@ -562,7 +785,6 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         }
 
         pub fn run(self: *Self, listener: posix.fd_t, ready_sem: *std.Thread.Semaphore) void {
-            self.listener = listener;
             var thread_pool = &self.thread_pool;
 
             self.loop.start() catch |err| {
@@ -603,13 +825,20 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 now = timestamp(now);
                 var closed_conn = false;
 
+                // Defer signal handling (which frees handed-over and closed
+                // connections) until the whole event batch is drained. A batch
+                // can hold a .signal and a .recv for the same connection;
+                // processing the signal first would free the connection and the
+                // later .recv would dereference freed memory in getState().
+                var has_signal = false;
+
                 while (it.next()) |event| {
                     switch (event) {
                         .accept => self.accept(listener, now) catch |err| {
                             log.err("Failed to accept connection: {}", .{err});
                             std.Thread.sleep(std.time.ns_per_ms * 5);
                         },
-                        .signal => self.processSignal(&closed_conn),
+                        .signal => has_signal = true,
                         .recv => |conn| switch (conn.protocol) {
                             .http => |http_conn| {
                                 switch (http_conn.getState()) {
@@ -663,6 +892,10 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                         .shutdown => return,
                     }
                 }
+
+                // Every .recv in this batch has been handled, so it is now safe
+                // to free the connections handed over since the last batch.
+                if (has_signal) self.processSignal(&closed_conn);
 
                 const batch_size = thread_pool.batch_size;
                 if (batch_size > 0) {
@@ -773,6 +1006,24 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
 
         fn processSignal(self: *Self, closed_bool: *bool) void {
             const loop = &self.loop;
+
+            {
+                var c = blk: {
+                    var wl = &self.ws_closed_list;
+                    wl.mut.lock();
+                    defer wl.mut.unlock();
+                    const head = wl.inner.head;
+                    wl.inner = .{};
+                    break :blk head;
+                };
+                while (c) |conn| {
+                    c = conn.next;
+                    closed_bool.* = true;
+                    self.len -= 1;
+                    self.conn_mem_pool.destroy(conn);
+                }
+            }
+
             var hl = &self.handover_list;
 
             // We take the handover list, and then re-initialize it. We do this
@@ -798,8 +1049,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 switch (http_conn.handover) {
                     .close, .unknown => {
                         closed_bool.* = true;
-                        // http handler already closed the socket
-                        self.disown(conn);
+                        // http handler already closed the socket.
+                        // release, not disown: the snapshot above already took
+                        // conn out of handover_list, and removing it again would
+                        // splice its stale prev/next into the live list.
+                        self.release(conn, http_conn);
                     },
                     .disown => {
                         // When res.disown() was called, we immediately removed
@@ -808,14 +1062,14 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                         // before we get back here.
                         // https://github.com/karlseguin/http.zig/issues/129#issuecomment-3031411404
                         closed_bool.* = true;
-                        self.disown(conn);
+                        self.release(conn, http_conn); // not disown: see .close
                     },
                     .websocket => |ptr| {
                         if (comptime WSH == httpz.DummyWebsocketHandler) {
                             std.debug.print("Your httpz handler must have a `WebsocketHandler` declaration. This must be the same type passed to `httpz.upgradeWebsocket`. Closing the connection.\n", .{});
                             closed_bool.* = true;
                             conn.close();
-                            self.disown(conn);
+                            self.release(conn, http_conn); // not disown: see .close
                             continue;
                         }
 
@@ -825,10 +1079,14 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                         conn.protocol = .{ .websocket = hc };
 
                         loop.switchToOneShot(conn) catch {
+                            // conn.protocol is now .websocket, so neither disown
+                            // nor release (both read conn.protocol.http) apply.
                             metrics.internalError();
                             closed_bool.* = true;
                             conn.close();
-                            self.disown(conn);
+                            self.websocket.cleanupConn(hc);
+                            self.len -= 1;
+                            self.conn_mem_pool.destroy(conn);
                             continue;
                         };
                     },
@@ -898,15 +1156,21 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 conn.releaseProcessing();
                 self.websocketClosed(conn);
             } else {
+                // Release before re-arming. The read event is one-shot: once
+                // re-armed it can fire on another thread at once, and an
+                // event that finds the connection still marked as processing
+                // is dropped with nothing left to re-arm it, so the
+                // connection would never be read again. Nothing can fire
+                // between the release and the re-arm: the event is disarmed.
+                conn.releaseProcessing();
                 self.loop.rearmRead(conn) catch |err| {
                     log.debug("({f}) failed to add read event monitor: {}", .{ ws_conn.address, err });
+                    // Still disarmed, so no other thread can be processing it.
                     ws_conn.close(.{ .code = 4998, .reason = "wsz" }) catch {};
                     self.websocket.cleanupConn(hc);
-                    conn.releaseProcessing();
                     self.websocketClosed(conn);
                     return;
                 };
-                conn.releaseProcessing();
             }
         }
 
@@ -916,17 +1180,16 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         /// protocol union switches to .websocket. The regular disown() cannot
         /// be used after this point because it accesses conn.protocol.http.
         ///
-        /// This function handles the WebSocket-specific teardown:
-        /// removing the Conn from the handover list, decrementing the
-        /// connection counter, and returning the Conn to the memory pool.
+        /// Called from the thread pool. The Conn is in no list after the
+        /// upgrade, and len, conn_mem_pool and the listener belong to the
+        /// worker thread, so the Conn is queued on ws_closed_list and the
+        /// worker frees it in processSignal.
         ///
-        /// Must be called AFTER releaseProcessing() and cleanupConn() to
-        /// avoid use-after-free — the Conn is destroyed by this call.
+        /// Must be called AFTER releaseProcessing() and cleanupConn(): the
+        /// Conn may be destroyed as soon as it is queued.
         fn websocketClosed(self: *Self, conn: *Conn(WSH)) void {
-            self.handover_list.remove(conn);
-            self.len -= 1;
-            self.conn_mem_pool.destroy(conn);
-            if (self.full) self.enableListener(self.listener);
+            self.ws_closed_list.insert(conn);
+            self.loop.signal() catch |err| log.err("failed to signal worker: {}", .{err});
         }
 
         fn disown(self: *Self, conn: *Conn(WSH)) void {
@@ -937,6 +1200,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 .keepalive => self.keepalive_list.remove(conn),
                 .active => unreachable,
             }
+            self.release(conn, http_conn);
+        }
+
+        /// Free a connection that is in no list.
+        fn release(self: *Self, conn: *Conn(WSH), http_conn: *HTTPConn) void {
             self.len -= 1;
             self.http_conn_pool.release(http_conn);
             self.conn_mem_pool.destroy(conn);

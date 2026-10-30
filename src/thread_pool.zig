@@ -7,6 +7,7 @@ pub const Opts = struct {
     count: u32,
     backlog: u32,
     buffer_size: usize,
+    stack_size: usize = Thread.SpawnConfig.default_stack_size,
 };
 
 pub fn ThreadPool(comptime F: anytype) type {
@@ -52,7 +53,7 @@ pub fn ThreadPool(comptime F: anytype) type {
                 workers[i] = try Worker(F).init(aa, &workers[@mod(i + i, workers.len)], opts);
             }
             for (0..workers.len) |i| {
-                threads[i] = try Thread.spawn(.{}, Worker(F).run, .{&workers[i]});
+                threads[i] = try Thread.spawn(.{ .stack_size = opts.stack_size }, Worker(F).run, .{&workers[i]});
                 started += 1;
             }
 

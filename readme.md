@@ -951,11 +951,11 @@ try httpz.listen(allocator, &router, .{
         .count = 1,
 
         // Maximum number of concurrent connection each worker can handle
-        // (blocking mode: currently ignored)
+        // (blocking mode: the maximum number of connections, each with its
+        // own thread; defaults to thread_pool.count)
         .max_conn = 8_192,
 
         // Minimum number of connection states each worker should maintain
-        // (blocking mode: currently ignored)
         .min_conn = 64,
 
         // A pool of larger buffers that can be used for any data larger than configured
@@ -977,7 +977,7 @@ try httpz.listen(allocator, &router, .{
     .thread_pool = .{
         // Number threads. If you're handlers are doing a lot of i/o, a higher
         // number might provide better throughput
-        // (blocking mode: handled differently)
+        // (blocking mode: no pool; the default for workers.max_conn)
         .count = 32,
 
         // The maximum number of pending requests that the thread pool will accept
@@ -988,7 +988,14 @@ try httpz.listen(allocator, &router, .{
         // Size of the static buffer to give each thread. Memory usage will be
         // `count * buffer_size`. If you're making heavy use of either `req.arena` or
         // `res.arena`, this is likely the single easiest way to gain performance.
+        // (blocking mode: each connection's thread gets one)
         .buffer_size = 8192,
+
+        // Stack size of each thread that runs application code (blocking
+        // mode: each connection's thread). Defaults to Zig's default thread
+        // stack size. On Windows the whole stack is committed when the thread
+        // starts, so a smaller one saves memory.
+        .stack_size = 16 * 1024 * 1024,
     },
 
     // options for tweaking request processing
@@ -1075,17 +1082,11 @@ The comptime-safe, `httpz.blockingMode() bool` function can be called to determi
 
 While you should always run httpz behind a reverse proxy, it's particularly important to do so in blocking mode due to the ease with which external connections can DOS the server.
 
-In blocking mode, `config.workers.count` is hard-coded to 1. (This worker does considerably less work than the non-blocking workers). If `config.workers.count` is > 1, than those extra workers will go towards `config.thread_pool.count`. In other words:
+In blocking mode, one thread accepts connections, and each connection then gets a thread of its own, which reads and parses its requests, runs application code and sends replies for as long as the connection is open. A WebSocket connection keeps its thread for its whole session.
 
-In non-blocking mode, if `config.workers.count = 2` and `config.thread_pool.count = 4`, then you'll have 6 threads: 2 threads that read+parse requests and send replies, and 4 threads to execute application code.
+In blocking mode, `config.workers.max_conn` is the maximum number of connections, and so of connection threads; it defaults to `config.thread_pool.count`. At the maximum, no more connections are accepted until one closes; new ones wait in the listen backlog. Each connection's thread has `config.thread_pool.stack_size` of stack and `config.thread_pool.buffer_size` of buffer; on Windows the whole stack is committed when the thread starts, so with many connections a smaller stack matters. `config.workers.min_conn` connection states are allocated up front, as in non-blocking mode. `config.workers.count` and `config.thread_pool.backlog` are ignored, and there is no thread pool.
 
-In blocking mode, the same config will also use 6 threads, but there will only be: 1 thread that accepts connections, and 5 threads to read+parse requests, send replies and execute application code.
-
-The goal is for the same configuration to result in the same # of threads regardless of the mode, and to have more thread_pool threads in blocking mode since they do more work.
-
-In blocking mode, `config.workers.large_buffer_count` defaults to the size of the thread pool.
-
-In blocking mode, `config.workers.max_conn` and `config.workers.min_conn` are ignored. The maximum number of connections is simply the size of the thread_pool.
+In blocking mode, `config.workers.large_buffer_count` defaults to `config.thread_pool.count`.
 
 If you aren't using a reverse proxy, you should always set the `config.timeout.request`, `config.timeout.keepalive` and `config.timeout.request_count` settings. In blocking mode, consider using conservative values: say 5/5/5 (5 second request timeout, 5 second keepalive timeout, and 5 keepalive count). You can monitor the `httpz_timeout_active` metric to see if the request timeout is too low.
 

@@ -261,6 +261,10 @@ pub fn Server(comptime H: type) type {
         _workers: []Worker,
         _cond: Thread.Condition,
         _listener: ?posix.socket_t,
+        // Set under _mut by listen(): started once accepting, err if it gave
+        // up. listenInNewThread waits for one of them.
+        _listen_started: bool,
+        _listen_err: ?anyerror,
         _max_request_per_connection: usize,
         _middlewares: []const Middleware(H),
         _websocket_state: websocket.server.WorkerState,
@@ -317,6 +321,8 @@ pub fn Server(comptime H: type) type {
                 ._cond = .{},
                 ._workers = workers,
                 ._listener = null,
+                ._listen_started = false,
+                ._listen_err = null,
                 ._middlewares = &.{},
                 ._middleware_registry = .{},
                 ._websocket_state = websocket_state,
@@ -345,6 +351,9 @@ pub fn Server(comptime H: type) type {
             defer self._cond.signal();
             self._mut.lock();
             errdefer self._mut.unlock();
+            // Runs before the unlock above, so a waiting listenInNewThread
+            // sees why listen() gave up (a port in use, most often).
+            errdefer |err| self._listen_err = err;
 
             const config = self.config;
 
@@ -358,12 +367,31 @@ pub fn Server(comptime H: type) type {
                 const proto = if (address.any.family == posix.AF.UNIX) @as(u32, 0) else posix.IPPROTO.TCP;
                 break :blk try posix.socket(address.any.family, sock_flags, proto);
             };
+            errdefer posix.close(listener);
 
             if (no_delay) {
                 try posix.setsockopt(listener, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
             }
 
-            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+            if (builtin.os.tag == .windows) {
+                // SO_REUSEADDR means something else on Windows: it lets a
+                // second listener bind a port one already has, so two servers
+                // (two copies of one app) silently share it and connections
+                // land on either. SO_EXCLUSIVEADDRUSE (~SO_REUSEADDR in
+                // winsock) refuses any second listener with WSAEADDRINUSE.
+                // Windows needs no option to rebind past TIME_WAIT. Set
+                // through winsock directly: as an int the option is negative,
+                // which posix.setsockopt's u32 option name can't carry.
+                const ws2_32 = std.os.windows.ws2_32;
+                const SO_EXCLUSIVEADDRUSE: i32 = ~@as(i32, ws2_32.SO.REUSEADDR);
+                const one = std.mem.toBytes(@as(c_int, 1));
+                if (ws2_32.setsockopt(listener, ws2_32.SOL.SOCKET, SO_EXCLUSIVEADDRUSE, &one, one.len) == ws2_32.SOCKET_ERROR) {
+                    log.err("Failed to set SO_EXCLUSIVEADDRUSE: {}", .{ws2_32.WSAGetLastError()});
+                    return error.Unexpected;
+                }
+            } else {
+                try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+            }
 
             if (!config.isUnixAddress() and self._workers.len > 1) {
                 if (@hasDecl(posix.SO, "REUSEPORT_LB")) {
@@ -380,6 +408,9 @@ pub fn Server(comptime H: type) type {
             }
 
             self._listener = listener;
+            // The errdefer above closes the socket on a later error; stop()
+            // must not close it a second time.
+            errdefer self._listener = null;
 
             var workers = self._workers;
             const allocator = self.allocator;
@@ -391,6 +422,7 @@ pub fn Server(comptime H: type) type {
                 const thrd = try Thread.spawn(.{}, worker.Blocking(*Self, WebsocketHandler).listen, .{ &workers[0], listener });
 
                 // incase listenInNewThread was used and is waiting for us to start
+                self._listen_started = true;
                 self._cond.signal();
                 self._mut.unlock();
 
@@ -424,6 +456,7 @@ pub fn Server(comptime H: type) type {
                 }
 
                 // incase listenInNewThread was used and is waiting for us to start
+                self._listen_started = true;
                 self._cond.signal();
                 self._mut.unlock();
 
@@ -436,10 +469,21 @@ pub fn Server(comptime H: type) type {
         pub fn listenInNewThread(self: *Self) !std.Thread {
             self._mut.lock();
             defer self._mut.unlock();
+            self._listen_started = false;
+            self._listen_err = null;
             const thrd = try std.Thread.spawn(.{}, listen, .{self});
 
-            // we don't return until listen() signals us that the server is up
-            self._cond.wait(&self._mut);
+            // we don't return until listen() signals us that the server is up,
+            // or that it couldn't start
+            while (!self._listen_started and self._listen_err == null) {
+                self._cond.wait(&self._mut);
+            }
+            if (self._listen_err) |err| {
+                self._mut.unlock();
+                defer self._mut.lock();
+                thrd.join();
+                return err;
+            }
 
             return thrd;
         }
@@ -967,6 +1011,19 @@ test "tests:afterAll" {
     try t.expectEqual(false, global_test_allocator.detectLeaks());
 }
 
+test "httpz: listenInNewThread reports a port that's already taken" {
+    var first = try Server(void).init(t.allocator, .{ .address = .localhost(6996) }, {});
+    defer first.deinit();
+    const first_thread = try first.listenInNewThread();
+
+    var second = try Server(void).init(t.allocator, .{ .address = .localhost(6996) }, {});
+    defer second.deinit();
+    try t.expectError(error.AddressInUse, second.listenInNewThread());
+
+    first.stop();
+    first_thread.join();
+}
+
 test "httpz: quick shutdown" {
     var server = try Server(void).init(t.allocator, .{ .address = .localhost(6992) }, {});
     const thrd = try server.listenInNewThread();
@@ -1002,6 +1059,54 @@ test "httpz: shutdown without listen" {
     var server = try Server(void).init(t.allocator, .{ .address = .localhost(6992) }, {});
     server.stop();
     server.deinit();
+}
+
+test "httpz: a connection that stays open doesn't hold up the ones after it" {
+    // In blocking mode a connection has a thread for as long as it's open: a
+    // WebSocket client's for its whole session. Connections made meanwhile
+    // must still be answered, however few pool threads there are.
+    var server = try Server(void).init(t.allocator, .{
+        .address = .localhost(6994),
+        .thread_pool = .{ .count = 2 },
+        .workers = .{ .max_conn = 16 },
+    }, {});
+    defer server.deinit();
+    var router = try server.router(.{});
+    router.get("/", testAnswerOk, .{});
+    const thrd = try server.listenInNewThread();
+    defer {
+        server.stop();
+        thrd.join();
+    }
+
+    // Open, and silent: with no request timeout it is never let go.
+    const idle = try std.net.tcpConnectToAddress(try std.net.Address.parseIp("127.0.0.1", 6994));
+    defer idle.close();
+
+    for (0..8) |i| {
+        const stream = try std.net.tcpConnectToAddress(try std.net.Address.parseIp("127.0.0.1", 6994));
+        defer stream.close();
+        // Windows takes a DWORD of milliseconds, everything else a timeval.
+        const timeout = if (builtin.os.tag == .windows) std.mem.toBytes(@as(u32, 2000)) else std.mem.toBytes(posix.timeval{ .sec = 2, .usec = 0 });
+        try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
+        _ = try posix.write(stream.handle, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        while (len < buf.len) {
+            const n = posix.read(stream.handle, buf[len..]) catch |err| {
+                std.debug.print("connection {d} after the open one: {}\n", .{ i, err });
+                return err;
+            };
+            if (n == 0) break;
+            len += n;
+        }
+        try t.expectString("HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nok", buf[0..len]);
+    }
+}
+
+fn testAnswerOk(_: *Request, res: *Response) !void {
+    res.body = "ok";
 }
 
 test "httpz: invalid request" {
@@ -2016,9 +2121,10 @@ test "websocket: connection counter released on close" {
     if (force_blocking) return; // non-blocking mode only
 
     // Start a dedicated server with a very low max_conn to trigger the bug quickly.
+    // Its own port: the shared test servers keep 5992-5999 bound all run.
     const max_conn = 4;
     var server = try Server(TestWebsocketHandler).init(t.allocator, .{
-        .address = .localhost(5999),
+        .address = .localhost(5989),
         .workers = .{ .count = 1, .max_conn = max_conn },
     }, TestWebsocketHandler{});
     var router = try server.router(.{});
@@ -2029,13 +2135,13 @@ test "websocket: connection counter released on close" {
         listen_thread.join();
         server.deinit();
     }
-    try testing.waitForPort(5999);
+    try testing.waitForPort(5989);
 
     // Open and close more WebSocket connections than max_conn.
     // Each connection does a full upgrade, exchanges a message, then closes.
     const total_connections = max_conn * 3; // 12 connections, well past the limit of 4
     for (0..total_connections) |_| {
-        const stream = testStream(5999);
+        const stream = testStream(5989);
         defer stream.close();
 
         var writer = stream.writer(&.{});
@@ -2066,7 +2172,7 @@ test "websocket: connection counter released on close" {
     // Verify the server still accepts new connections by doing one more WS upgrade.
     // Without the fix, this would hang forever because len == max_conn.
     {
-        const stream = testStream(5999);
+        const stream = testStream(5989);
         defer stream.close();
         var writer = stream.writer(&.{});
         const w = &writer.interface;
