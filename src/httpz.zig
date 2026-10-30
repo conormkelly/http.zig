@@ -1038,6 +1038,91 @@ test "httpz: quick shutdown" {
     server.deinit();
 }
 
+// A request still inside its handler when stop() is called finishes after
+// the event loop has exited, so its connection is left in the handover list
+// for deinit, and its socket must still be closed exactly once. A response
+// that ends the connection leaves the socket for deinit to close; an upgrade
+// hands it to the websocket worker, whose shutdown closes it, so the handler
+// must finish before that shutdown. Closing a socket twice panics on EBADF;
+// never closing it leaves the client waiting on a connection nobody serves.
+const ShutdownGate = struct {
+    entered: std.Thread.ResetEvent = .{},
+    release: std.Thread.ResetEvent = .{},
+
+    const Handler = struct {
+        gate: *ShutdownGate,
+        pub const WebsocketHandler = TestWebsocketHandler.WebsocketHandler;
+
+        fn close(h: Handler, _: *Request, res: *Response) !void {
+            h.gate.entered.set();
+            h.gate.release.wait();
+            res.body = "ok";
+        }
+
+        fn upgrade(h: Handler, req: *Request, res: *Response) !void {
+            h.gate.entered.set();
+            h.gate.release.wait();
+            if (try upgradeWebsocket(WebsocketHandler, req, res, 9001) == false) {
+                res.status = 500;
+            }
+        }
+    };
+
+    fn run(port: u16, http_request: []const u8) !void {
+        var gate = ShutdownGate{};
+        var server = try Server(Handler).init(t.allocator, .{
+            .address = .localhost(port),
+            .workers = .{ .count = 1 },
+        }, .{ .gate = &gate });
+        var router = try server.router(.{});
+        router.get("/close", Handler.close, .{});
+        router.get("/ws", Handler.upgrade, .{});
+        const listen_thread = try server.listenInNewThread();
+        try testing.waitForPort(port);
+
+        const stream = testStream(port);
+        defer stream.close();
+        var writer = stream.writer(&.{});
+        try writer.interface.writeAll(http_request);
+        try writer.interface.flush();
+        try gate.entered.timedWait(2 * std.time.ns_per_s);
+
+        // Let the event loop exit while the handler is still running, then
+        // let the handler finish into the handover list.
+        server.stop();
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+        gate.release.set();
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+
+        listen_thread.join();
+        server.deinit();
+
+        // The server is gone, so the client must see its connection end.
+        var buf: [512]u8 = undefined;
+        var timer = try std.time.Timer.start();
+        while (timer.read() < 2 * std.time.ns_per_s) {
+            const n = posix.read(stream.handle, &buf) catch |err| switch (err) {
+                error.WouldBlock => continue, // testStream's short read timeout
+                error.ConnectionResetByPeer => return,
+                else => return err,
+            };
+            if (n == 0) return;
+        }
+        return error.ConnectionLeftOpen;
+    }
+};
+
+test "httpz: stopping mid-request closes the connection's socket exactly once" {
+    if (force_blocking) return; // the handover list is non-blocking mode's
+    try ShutdownGate.run(5980, "GET /close HTTP/1.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+}
+
+test "httpz: stopping mid-upgrade closes the WebSocket's socket exactly once" {
+    if (force_blocking) return; // the handover list is non-blocking mode's
+    try ShutdownGate.run(5981, "GET /ws HTTP/1.1\r\nContent-Length: 0\r\nupgrade: websocket\r\n" ++
+        "Sec-Websocket-Version: 13\r\nConnection: upgrade\r\nSec-Websocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+}
+
 test "httpz: bind failure releases mutex" {
     // Start a server to occupy the port
     var server1 = try Server(void).init(t.allocator, .{ .address = .localhost(6993) }, {});

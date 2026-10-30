@@ -832,6 +832,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             };
             ready_sem.post();
             defer self.websocket.shutdown();
+            // Runs first (defers unwind in reverse): let in-flight request
+            // jobs finish before the websocket side shuts down, so an upgrade
+            // a job completes is still closed by that shutdown. deinit's
+            // stop() comes after websocket.shutdown(), too late for that.
+            defer thread_pool.stop();
 
             var now = timestamp(0);
             var last_timeout = now;
