@@ -1161,8 +1161,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
             http_conn.requestDone(self.retain_allocated_bytes, handover == .keepalive or handover == .websocket) catch {
                 // This means we failed to put the connection into
                 // nonblocking mode. Rare, but safer to close the connection
-                // at this point.
+                // at this point. Record it on the conn too: processSignal and
+                // shutdownHandoverList read http_conn.handover to know who
+                // owns the socket and whether to close it.
                 handover = .close;
+                http_conn.handover = .close;
             };
 
             switch (handover) {
