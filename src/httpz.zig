@@ -1113,12 +1113,14 @@ const ShutdownGate = struct {
 };
 
 test "httpz: stopping mid-request closes the connection's socket exactly once" {
-    if (force_blocking) return; // the handover list is non-blocking mode's
+    // The handover list is non-blocking mode's.
+    if (comptime blockingMode()) return error.SkipZigTest;
     try ShutdownGate.run(5980, "GET /close HTTP/1.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
 }
 
 test "httpz: stopping mid-upgrade closes the WebSocket's socket exactly once" {
-    if (force_blocking) return; // the handover list is non-blocking mode's
+    // The handover list is non-blocking mode's.
+    if (comptime blockingMode()) return error.SkipZigTest;
     try ShutdownGate.run(5981, "GET /ws HTTP/1.1\r\nContent-Length: 0\r\nupgrade: websocket\r\n" ++
         "Sec-Websocket-Version: 13\r\nConnection: upgrade\r\nSec-Websocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
 }
@@ -1298,6 +1300,9 @@ const DisownedClosedHandler = struct {
 // before it closes it: otherwise the registration outlives the connection, and its event points at the freed Conn.
 // `dup` stands in for the forked copy. Covers the parse-error path and the keepalive timeout sweep, on one server.
 test "httpz: a closed connection leaves epoll while another copy of its socket is open" {
+    // The event loop is non-blocking mode's (and dup a POSIX call).
+    if (comptime blockingMode()) return error.SkipZigTest;
+
     const H = HeldSocketHandler;
     H.held.store(-1, .release);
 
