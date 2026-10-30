@@ -1163,9 +1163,11 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 // nonblocking mode. Rare, but safer to close the connection
                 // at this point. Record it on the conn too: processSignal and
                 // shutdownHandoverList read http_conn.handover to know who
-                // owns the socket and whether to close it.
+                // owns the socket and whether to close it. Not for an upgrade:
+                // its socket already belongs to a websocket HandlerConn, which
+                // closes it, so marking it .close would close it twice.
                 handover = .close;
-                http_conn.handover = .close;
+                if (http_conn.handover != .websocket) http_conn.handover = .close;
             };
 
             switch (handover) {

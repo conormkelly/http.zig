@@ -2351,7 +2351,7 @@ test "websocket: upgrade" {
 // Run repeatedly (e.g. zig build test -Dtest-filter="websocket: stress" or run 50x)
 // to verify no race in reader.done() / allocator free when using thread pool.
 test "websocket: stress" {
-    if (force_blocking) return; // non-blocking mode only (thread pool)
+    if (blockingMode()) return; // non-blocking mode only (thread pool)
     const num_clients = 8;
     const messages_per_client = 150;
 
@@ -2418,7 +2418,7 @@ test "websocket: stress" {
 // and after max_conn total WebSocket connections have been opened and closed
 // (cumulative, not concurrent), the worker permanently stops accepting.
 test "websocket: connection counter released on close" {
-    if (force_blocking) return; // non-blocking mode only
+    if (blockingMode()) return; // non-blocking mode only
 
     // Start a dedicated server with a very low max_conn to trigger the bug quickly.
     // Its own port: the shared test servers keep 5992-5999 bound all run.
