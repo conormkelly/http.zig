@@ -524,11 +524,9 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             return conn.handover;
         }
 
+        // The websocket worker made the socket non-blocking, so the request
+        // timeout set on it (SO_RCVTIMEO) no longer applies.
         fn handleWebSocket(self: *const Self, hc: *ws.HandlerConn(WSH)) !void {
-            posix.setsockopt(hc.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &Timeout.init(null).timeval) catch |err| {
-                self.websocket.cleanupConn(hc);
-                return err;
-            };
             // closes the connection before returning
             return self.websocket.worker.readLoop(hc);
         }
