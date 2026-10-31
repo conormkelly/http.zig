@@ -211,13 +211,14 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                 // elsewhere shutdown does, leaving the close to the thread,
                 // so the socket's number can't be reused under it.
                 // A socket handed off (to the websocket worker, or disowned
-                // by the application) is its new owner's to end.
+                // by the application) is its new owner's to end, and a busy
+                // one (its thread in a request handler) its own thread's.
                 self.mut.lock();
                 defer self.mut.unlock();
                 var node = self.connections.head;
                 while (node) |n| {
                     node = n.next;
-                    if (n.closed or n.handed_off) continue;
+                    if (n.closed or n.handed_off or n.busy) continue;
                     if (builtin.os.tag == .windows) {
                         n.closed = true;
                         posix.close(n.socket);
@@ -341,6 +342,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                     .prev = null,
                     .socket = socket,
                     .mut = &self.mut,
+                    .stopping = &self.stopping,
                 };
                 self.connections.insert(node);
                 break :blk node;
@@ -385,8 +387,8 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                         // between upgradeWebsocket and this handover point. Sync from the
                         // authoritative conn.stream.handle which remains correct.
                         hc.socket = hc.conn.stream.handle;
-                        // The websocket worker closes it, and ends it on stop.
-                        connection_node.handOff();
+                        // upgradeWebsocket already handed the socket to the
+                        // websocket worker, which closes it and ends it on stop.
                         // impossible for this to fail in blocking mode
                         conn.requestDone(self.retain_allocated_bytes_keepalive, false) catch unreachable;
                         self.http_conn_pool.release(conn);
@@ -508,7 +510,17 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             }
 
             metrics.request();
+            // Once a request is in, its handler runs to the end, untouched by
+            // stopping: listen leaves a busy socket alone (on Windows, a send
+            // on a socket closed or shut down under it is unreachable in Zig's
+            // std). Stopping refuses new requests, and a connection that was
+            // busy when it began ends here rather than reading again, since
+            // nothing will wake that read.
+            const node = conn.tracked orelse unreachable;
+            if (!node.beginHandling()) return .close;
             self.server.handleRequest(conn, thread_buf);
+            const stopping = node.endHandling();
+            if (stopping and conn.handover == .keepalive) return .close;
             return conn.handover;
         }
 
@@ -539,10 +551,39 @@ const TrackedSocket = struct {
     // disowning it), which may close it at any point: listen() must not
     // touch it, or it could shut down or close a closed or reused socket.
     handed_off: bool = false,
+    // The worker's: set before stop() shuts the websocket worker down or
+    // listen() goes through the list.
+    stopping: *const std.atomic.Value(bool),
+    // Its thread is running a request handler, not reading: listen() must
+    // leave the socket alone, and the thread ends the connection itself.
+    busy: bool = false,
 
-    fn handOff(self: *TrackedSocket) void {
+    // False once stopping: the request is refused.
+    fn beginHandling(self: *TrackedSocket) bool {
         self.mut.lock();
         defer self.mut.unlock();
+        if (self.stopping.load(.acquire)) return false;
+        self.busy = true;
+        return true;
+    }
+
+    // Whether the server is stopping, in which case listen() skipped this
+    // socket and the connection must end without reading again.
+    fn endHandling(self: *TrackedSocket) bool {
+        self.mut.lock();
+        defer self.mut.unlock();
+        self.busy = false;
+        return self.stopping.load(.acquire);
+    }
+
+    // Refused once the server is stopping. The websocket worker's shutdown
+    // may already have run and would never end the connection, and listen()
+    // may already have closed the socket; either way the connection ends as
+    // an ordinary one, closed once by its own thread.
+    fn handOff(self: *TrackedSocket) error{ServerStopping}!void {
+        self.mut.lock();
+        defer self.mut.unlock();
+        if (self.closed or self.stopping.load(.acquire)) return error.ServerStopping;
         self.handed_off = true;
     }
 };
@@ -1163,11 +1204,21 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 // nonblocking mode. Rare, but safer to close the connection
                 // at this point. Record it on the conn too: processSignal and
                 // shutdownHandoverList read http_conn.handover to know who
-                // owns the socket and whether to close it. Not for an upgrade:
-                // its socket already belongs to a websocket HandlerConn, which
-                // closes it, so marking it .close would close it twice.
-                handover = .close;
-                if (http_conn.handover != .websocket) http_conn.handover = .close;
+                // owns the socket and whether to close it.
+                switch (handover) {
+                    .websocket => |ptr| {
+                        // The socket already belongs to the websocket conn:
+                        // end it there, and leave httpz nothing to close.
+                        const hc: *ws.HandlerConn(WSH) = @ptrCast(@alignCast(ptr));
+                        http_conn.abandon();
+                        self.websocket.cleanupConn(hc);
+                        handover = .disown;
+                    },
+                    else => {
+                        handover = .close;
+                        http_conn.handover = .close;
+                    },
+                }
             };
 
             switch (handover) {
@@ -2111,8 +2162,12 @@ pub const HTTPConn = struct {
 
         if (comptime httpz.blockingMode()) {
             // The new owner may close the socket at any point, so listen()
-            // must leave it alone from now on.
-            if (self.tracked) |tracked| tracked.handOff();
+            // must leave it alone from now on. Refused while stopping: the
+            // connection then ends as an ordinary one.
+            if (self.tracked) |tracked| tracked.handOff() catch |err| {
+                self.handover = .close;
+                return err;
+            };
             return;
         }
 
@@ -2135,6 +2190,36 @@ pub const HTTPConn = struct {
                 return posix.epoll_ctl(loop, std.os.linux.EPOLL.CTL_DEL, socket, null);
             },
         }
+    }
+
+    /// Blocking mode: hand the socket to the websocket worker before it takes
+    /// it, so listen() leaves it alone. Refused once the server is stopping.
+    pub fn handOffToWebsocket(self: *HTTPConn) !void {
+        if (comptime httpz.blockingMode()) {
+            if (self.tracked) |tracked| try tracked.handOff();
+        }
+    }
+
+    /// Blocking mode: whether the server has started stopping.
+    pub fn serverStopping(self: *const HTTPConn) bool {
+        if (comptime httpz.blockingMode()) {
+            if (self.tracked) |tracked| return tracked.stopping.load(.acquire);
+        }
+        return false;
+    }
+
+    /// The socket's new owner (a websocket conn) closes it: make sure httpz
+    /// doesn't close it as well. Non-blocking mode removes it from the event
+    /// loop first, as disown does.
+    pub fn abandon(self: *HTTPConn) void {
+        if (comptime httpz.blockingMode()) {
+            // Already handed off, so listen() leaves it alone.
+            self.handover = .disown;
+            return;
+        }
+        self.disown() catch {
+            self.handover = .disown;
+        };
     }
 
     pub fn requestDone(self: *HTTPConn, retain_allocated_bytes: usize, revert_blocking: bool) !void {

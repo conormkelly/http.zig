@@ -718,8 +718,23 @@ pub fn upgradeWebsocket(comptime H: type, req: *Request, res: *Response, ctx: an
     const http_conn = res.conn;
     const ws_worker: *websocket.server.Worker(H) = @ptrCast(@alignCast(http_conn.ws_worker));
 
-    var hc = try ws_worker.createConn(http_conn.stream.handle, http_conn.address, worker.timestamp(0));
-    errdefer ws_worker.cleanupConn(hc);
+    // From here the websocket worker owns the socket and is the one to close
+    // it. Refused once the server is stopping: the connection then ends as an
+    // ordinary one.
+    try http_conn.handOffToWebsocket();
+    // On failure past this point the socket is closed: nothing (not even an
+    // error response) may be written to it, its number may be reused.
+    var hc = ws_worker.createConn(http_conn.stream.handle, http_conn.address, worker.timestamp(0)) catch |err| {
+        // createConn closed the socket.
+        res.written = true;
+        http_conn.abandon();
+        return err;
+    };
+    errdefer {
+        res.written = true;
+        http_conn.abandon();
+        ws_worker.cleanupConn(hc);
+    }
 
     hc.handler = try H.init(&hc.conn, ctx);
 
@@ -742,6 +757,13 @@ pub fn upgradeWebsocket(comptime H: type, req: *Request, res: *Response, ctx: an
         try if (comptime params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
     }
     try ws_worker.setupConnection(hc);
+
+    // Blocking mode: if stopping began during the upgrade, the websocket
+    // worker's shutdown may already have gone through its connections and
+    // missed this one, which would then never end. End it here (closing a
+    // websocket conn twice is harmless).
+    if (http_conn.serverStopping()) return error.ServerStopping;
+
     res.written = true;
     http_conn.handover = .{ .websocket = hc };
     return true;
@@ -1087,21 +1109,34 @@ const ShutdownGate = struct {
         try writer.interface.flush();
         try gate.entered.timedWait(2 * std.time.ns_per_s);
 
-        // Let the event loop exit while the handler is still running, then
-        // let the handler finish into the handover list.
+        // Stop while the handler is still running, then let it finish: in
+        // non-blocking mode into the handover list after the event loop has
+        // exited; in blocking mode after the websocket worker has shut down.
         server.stop();
         std.Thread.sleep(50 * std.time.ns_per_ms);
         gate.release.set();
         std.Thread.sleep(50 * std.time.ns_per_ms);
 
-        listen_thread.join();
+        // A connection nothing will end keeps the listen thread waiting for
+        // ever; fail instead of hanging the run.
+        var joined = std.Thread.ResetEvent{};
+        const joiner = try std.Thread.spawn(.{}, struct {
+            fn join(thread: std.Thread, done: *std.Thread.ResetEvent) void {
+                thread.join();
+                done.set();
+            }
+        }.join, .{ listen_thread, &joined });
+        joined.timedWait(10 * std.time.ns_per_s) catch return error.StopHung;
+        joiner.join();
         server.deinit();
 
         // The server is gone, so the client must see its connection end.
+        // recv, not read: on Windows posix.read uses ReadFile, which rejects
+        // sockets opened for overlapped I/O.
         var buf: [512]u8 = undefined;
         var timer = try std.time.Timer.start();
         while (timer.read() < 2 * std.time.ns_per_s) {
-            const n = posix.read(stream.handle, &buf) catch |err| switch (err) {
+            const n = posix.recv(stream.handle, &buf, 0) catch |err| switch (err) {
                 error.WouldBlock => continue, // testStream's short read timeout
                 error.ConnectionResetByPeer => return,
                 else => return err,
@@ -1113,14 +1148,10 @@ const ShutdownGate = struct {
 };
 
 test "httpz: stopping mid-request closes the connection's socket exactly once" {
-    // The handover list is non-blocking mode's.
-    if (comptime blockingMode()) return error.SkipZigTest;
     try ShutdownGate.run(5980, "GET /close HTTP/1.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
 }
 
 test "httpz: stopping mid-upgrade closes the WebSocket's socket exactly once" {
-    // The handover list is non-blocking mode's.
-    if (comptime blockingMode()) return error.SkipZigTest;
     try ShutdownGate.run(5981, "GET /ws HTTP/1.1\r\nContent-Length: 0\r\nupgrade: websocket\r\n" ++
         "Sec-Websocket-Version: 13\r\nConnection: upgrade\r\nSec-Websocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
 }
@@ -1205,12 +1236,13 @@ fn testAnswerOk(_: *Request, res: *Response) !void {
 }
 
 // https://github.com/karlseguin/http.zig/issues/223
-// A handler that's still in-flight when the server is stopped completes during
-// deinit (thread_pool.stop() joins it), which puts its conn in handover_list
-// with the event loop already gone - so processSignal never applies the
+// A handler that's still in-flight when the server is stopped completes after
+// the event loop has exited (run() drains the thread pool on its way out),
+// which puts its conn in handover_list with nothing left to apply the
 // handover. Shutting that list down has to respect the handover, or we close a
 // socket the application already owns (and here, already closed): .BADF, which
-// posix.close treats as unreachable.
+// posix.close treats as unreachable. In blocking mode the disown is refused
+// once stopping, and the connection's own thread closes it.
 test "httpz: disowned connection still in handover at shutdown" {
     const H = ShutdownDisownHandler;
     H.in_handler.store(false, .release);
@@ -1230,8 +1262,9 @@ test "httpz: disowned connection still in handover at shutdown" {
         }
 
         // The handler is parked inside the request. Stop the server out from
-        // under it, then let it finish and disown.
+        // under it, let the event loop exit, then let it finish and disown.
         server.stop();
+        std.Thread.sleep(50 * std.time.ns_per_ms);
         H.may_finish.store(true, .release);
     }
 
@@ -1249,12 +1282,14 @@ const ShutdownDisownHandler = struct {
             std.Thread.sleep(5 * std.time.ns_per_ms);
         }
 
-        const socket = res.conn.stream.handle;
-        res.disown() catch unreachable;
+        const stream = res.conn.stream;
+        // Fails if stopping already closed the socket (blocking mode on
+        // Windows closes, rather than shuts down, running connections).
+        res.disown() catch return;
 
         // We're the owner now, so we're the one that closes it. httpz must not
         // close it again during shutdown.
-        posix.close(socket);
+        stream.close();
     }
 };
 
@@ -1288,9 +1323,9 @@ const DisownedClosedHandler = struct {
     var may_finish: std.Thread.ResetEvent = .{};
 
     pub fn handle(_: DisownedClosedHandler, _: *Request, res: *Response) void {
-        const socket = res.conn.stream.handle;
+        const stream = res.conn.stream;
         res.disown() catch unreachable;
-        posix.close(socket);
+        stream.close();
         closed.set();
         // Still running, so in blocking mode the connection's thread is too.
         may_finish.wait();
