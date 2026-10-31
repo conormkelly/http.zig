@@ -747,10 +747,10 @@ pub fn upgradeWebsocket(comptime H: type, req: *Request, res: *Response, ctx: an
 
     var reply_buf: [512]u8 = undefined;
     const reply = try websocket.Handshake.createReply(key, null, compression, &reply_buf);
-    var writer = http_conn.stream.writer(&.{});
-    const w = &writer.interface;
-    try w.writeAll(reply);
-    try w.flush();
+    // Through the conn, which queues what a full socket doesn't take: the
+    // socket is non-blocking now (in either mode), and the handler may
+    // already have written to it.
+    try hc.conn.writeFramed(reply);
 
     if (comptime std.meta.hasFn(H, "afterInit")) {
         const params = @typeInfo(@TypeOf(H.afterInit)).@"fn".params;
@@ -1307,11 +1307,7 @@ const HandlerShutdownRace = struct {
             // The connection's own thread, not the one stopping the server.
             try t.expectEqual(false, closer.load(.monotonic) == stopper);
         }
-        // On Windows, waking a blocked read means closing its socket, so a
-        // connection woken mid-message is closed before its handler.
-        if (!(blockingMode() and builtin.os.tag == .windows and s == .message_in_flight)) {
-            try t.expectEqual(false, socket_closed_at_close.load(.monotonic));
-        }
+        try t.expectEqual(false, socket_closed_at_close.load(.monotonic));
     }
 };
 
