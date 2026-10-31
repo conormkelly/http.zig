@@ -758,10 +758,10 @@ pub fn upgradeWebsocket(comptime H: type, req: *Request, res: *Response, ctx: an
     }
     try ws_worker.setupConnection(hc);
 
-    // Blocking mode: if stopping began during the upgrade, the websocket
-    // worker's shutdown may already have gone through its connections and
-    // missed this one, which would then never end. End it here (closing a
-    // websocket conn twice is harmless).
+    // Blocking mode: if stopping began during the upgrade, end the connection
+    // here. The websocket worker's shutdown has either asked it to stop
+    // (readLoop would see that too) or gone through its connections before
+    // this one was added and missed it, and then nothing would end it.
     if (http_conn.serverStopping()) return error.ServerStopping;
 
     res.written = true;
@@ -1154,6 +1154,177 @@ test "httpz: stopping mid-request closes the connection's socket exactly once" {
 test "httpz: stopping mid-upgrade closes the WebSocket's socket exactly once" {
     try ShutdownGate.run(5981, "GET /ws HTTP/1.1\r\nContent-Length: 0\r\nupgrade: websocket\r\n" ++
         "Sec-Websocket-Version: 13\r\nConnection: upgrade\r\nSec-Websocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+}
+
+// A WebSocket handler is used by one thread at a time and closed exactly
+// once, however stop() lands, and its socket stays usable until its own
+// thread is done with it. In blocking mode a connection's own thread runs its
+// handler, writes the upgrade's reply and closes the handler when its
+// connection ends, while stop() runs the websocket worker's shutdown on
+// another thread. If the shutdown closes the handler too, or closes it under
+// the thread still using it, the second user reads a handler that
+// `hc.handler = null` has zeroed; if it closes the socket before the reply
+// is written, the write fails with EBADF or WSAENOTSOCK, which std treats as
+// unreachable.
+const HandlerShutdownRace = struct {
+    const Scenario = enum { init_in_progress, upgrade_refused_while_stopping, message_in_flight };
+
+    var scenario: Scenario = undefined;
+    var stopper: std.Thread.Id = undefined;
+    var closer: std.atomic.Value(std.Thread.Id) = .init(0);
+    // Whether the socket was already closed when close() ran: until then the
+    // application may still write to the conn from other threads.
+    var socket_closed_at_close: std.atomic.Value(bool) = .init(false);
+    // The handler has reached the point the scenario holds it at.
+    var holding: std.Thread.ResetEvent = .{};
+    // Set just before stop() is called.
+    var stopping: std.Thread.ResetEvent = .{};
+
+    const Shared = struct {
+        lock: std.Thread.RwLock = .{},
+        open: usize = 0,
+        // Every call, including any after the first.
+        close_calls: std.atomic.Value(u32) = .init(0),
+    };
+
+    const App = struct {
+        shared: *Shared,
+        pub const WebsocketHandler = Handler;
+
+        fn upgrade(app: *App, req: *Request, res: *Response) !void {
+            const ctx = Handler.Context{ .shared = app.shared };
+            if (try upgradeWebsocket(Handler, req, res, &ctx) == false) {
+                res.status = 500;
+            }
+        }
+    };
+
+    const Handler = struct {
+        shared: *Shared,
+        conn: *websocket.Conn,
+        closed: bool = false,
+
+        const Context = struct { shared: *Shared };
+
+        // Holds the handler until stop() has had time to run the websocket
+        // worker's shutdown.
+        fn holdUntilStopping() void {
+            holding.set();
+            stopping.timedWait(2 * std.time.ns_per_s) catch {};
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+
+        // Before the upgrade's 101 reply is written.
+        pub fn init(conn: *websocket.Conn, ctx: *const Context) !Handler {
+            {
+                ctx.shared.lock.lock();
+                defer ctx.shared.lock.unlock();
+                ctx.shared.open += 1;
+            }
+            if (scenario == .init_in_progress) holdUntilStopping();
+            return .{ .shared = ctx.shared, .conn = conn };
+        }
+
+        // After the 101 is written and before upgradeWebsocket's stopping
+        // re-check, which ends the connection on this thread.
+        pub fn afterInit(_: *Handler) !void {
+            if (scenario == .upgrade_refused_while_stopping) holdUntilStopping();
+        }
+
+        // Still running as the server stops; then uses its own fields, as
+        // any handler does.
+        pub fn clientMessage(self: *Handler, _: []const u8) !void {
+            holdUntilStopping();
+            self.shared.lock.lock();
+            defer self.shared.lock.unlock();
+        }
+
+        pub fn close(self: *Handler) void {
+            _ = self.shared.close_calls.fetchAdd(1, .monotonic);
+            closer.store(std.Thread.getCurrentId(), .monotonic);
+            socket_closed_at_close.store(self.conn.isClosed(), .monotonic);
+            if (self.closed) return;
+            self.closed = true;
+            self.shared.lock.lock();
+            defer self.shared.lock.unlock();
+            self.shared.open -= 1;
+        }
+    };
+
+    const upgrade_request = "GET /ws HTTP/1.1\r\nContent-Length: 0\r\nupgrade: websocket\r\n" ++
+        "Sec-Websocket-Version: 13\r\nConnection: upgrade\r\nSec-Websocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    // FIN + text, masked with a zero key, "hello".
+    const text_frame = [_]u8{ 0x81, 0x85, 0, 0, 0, 0 } ++ "hello".*;
+
+    fn run(port: u16, s: Scenario) !void {
+        scenario = s;
+        holding.reset();
+        stopping.reset();
+        closer.store(0, .monotonic);
+        socket_closed_at_close.store(false, .monotonic);
+
+        var shared = Shared{};
+        var app = App{ .shared = &shared };
+        var server = try Server(*App).init(t.allocator, .{
+            .address = .localhost(port),
+            .workers = .{ .count = 1 },
+        }, &app);
+        defer server.deinit();
+        var router = try server.router(.{});
+        router.get("/ws", App.upgrade, .{});
+        const listen_thread = try server.listenInNewThread();
+        try testing.waitForPort(port);
+
+        const stream = try std.net.tcpConnectToAddress(try std.net.Address.parseIp("127.0.0.1", port));
+        defer stream.close();
+        // send/recv go through Winsock; posix.read/write use ReadFile/WriteFile
+        // on Windows, which reject sockets opened for overlapped I/O.
+        _ = try posix.send(stream.handle, upgrade_request, 0);
+        if (s != .init_in_progress) {
+            var buf: [512]u8 = undefined;
+            const n = try posix.recv(stream.handle, &buf, 0);
+            try t.expectEqual(true, std.mem.startsWith(u8, buf[0..n], "HTTP/1.1 101"));
+        }
+        if (s == .message_in_flight) {
+            _ = try posix.send(stream.handle, &text_frame, 0);
+        }
+        try holding.timedWait(2 * std.time.ns_per_s);
+
+        stopper = std.Thread.getCurrentId();
+        stopping.set();
+        server.stop();
+        listen_thread.join();
+
+        if (s == .init_in_progress) {
+            // The reply went out on a socket shutdown had left open.
+            var buf: [512]u8 = undefined;
+            const n = try posix.recv(stream.handle, &buf, 0);
+            try t.expectEqual(true, std.mem.startsWith(u8, buf[0..n], "HTTP/1.1 101"));
+        }
+        try t.expectEqual(1, shared.close_calls.load(.monotonic));
+        try t.expectEqual(0, shared.open);
+        if (comptime blockingMode()) {
+            // The connection's own thread, not the one stopping the server.
+            try t.expectEqual(false, closer.load(.monotonic) == stopper);
+        }
+        // On Windows, waking a blocked read means closing its socket, so a
+        // connection woken mid-message is closed before its handler.
+        if (!(blockingMode() and builtin.os.tag == .windows and s == .message_in_flight)) {
+            try t.expectEqual(false, socket_closed_at_close.load(.monotonic));
+        }
+    }
+};
+
+test "httpz: stopping during a WebSocket handler's init leaves its socket open for the reply" {
+    try HandlerShutdownRace.run(5990, .init_in_progress);
+}
+
+test "httpz: an upgrade refused as the server stops closes its handler once, on its own thread" {
+    try HandlerShutdownRace.run(5987, .upgrade_refused_while_stopping);
+}
+
+test "httpz: stopping while a handler is in clientMessage leaves the handler intact" {
+    try HandlerShutdownRace.run(5988, .message_in_flight);
 }
 
 test "httpz: bind failure releases mutex" {
