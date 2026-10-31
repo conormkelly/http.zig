@@ -1182,12 +1182,14 @@ test "httpz: a connection that stays open doesn't hold up the ones after it" {
         // Windows takes a DWORD of milliseconds, everything else a timeval.
         const timeout = if (builtin.os.tag == .windows) std.mem.toBytes(@as(u32, 2000)) else std.mem.toBytes(posix.timeval{ .sec = 2, .usec = 0 });
         try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
-        _ = try posix.write(stream.handle, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+        // send/recv go through Winsock; posix.read/write use ReadFile/WriteFile
+        // on Windows, which reject sockets opened for overlapped I/O.
+        _ = try posix.send(stream.handle, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n", 0);
 
         var buf: [256]u8 = undefined;
         var len: usize = 0;
         while (len < buf.len) {
-            const n = posix.read(stream.handle, buf[len..]) catch |err| {
+            const n = posix.recv(stream.handle, buf[len..], 0) catch |err| {
                 std.debug.print("connection {d} after the open one: {}\n", .{ i, err });
                 return err;
             };
