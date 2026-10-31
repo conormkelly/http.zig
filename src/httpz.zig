@@ -357,7 +357,7 @@ pub fn Server(comptime H: type) type {
 
             const config = self.config;
 
-            const no_delay = config.isUnixAddress();
+            const is_unix_socket = config.isUnixAddress();
             const address = try config.parseAddress();
 
             const listener = blk: {
@@ -369,7 +369,7 @@ pub fn Server(comptime H: type) type {
             };
             errdefer posix.close(listener);
 
-            if (no_delay) {
+            if (is_unix_socket == false) {
                 try posix.setsockopt(listener, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
             }
 
@@ -393,7 +393,7 @@ pub fn Server(comptime H: type) type {
                 try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
             }
 
-            if (!config.isUnixAddress() and self._workers.len > 1) {
+            if (is_unix_socket == false and self._workers.len > 1) {
                 if (@hasDecl(posix.SO, "REUSEPORT_LB")) {
                     try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT_LB, &std.mem.toBytes(@as(c_int, 1)));
                 } else if (@hasDecl(posix.SO, "REUSEPORT")) {
@@ -463,6 +463,10 @@ pub fn Server(comptime H: type) type {
                 for (threads) |thrd| {
                     thrd.join();
                 }
+
+                // Closed here rather than in stop(): until its thread exits, a
+                // worker can still re-arm the listener in its event loop.
+                posix.close(listener);
             }
         }
 
@@ -501,15 +505,17 @@ pub fn Server(comptime H: type) type {
                 w.stop();
             }
 
-            if (self._listener) |l| {
-                if (comptime blockingMode()) {
+            if (comptime blockingMode()) {
+                if (self._listener) |l| {
                     // necessary to unblock accept on linux
                     // (which might not be that necessary since, on Linux,
                     // NonBlocking should be used)
                     posix.shutdown(l, .recv) catch {};
+                    posix.close(l);
                 }
-                posix.close(l);
             }
+            // In nonblocking mode, listen() closes the listener once its
+            // workers have exited.
         }
 
         pub fn router(self: *Self, config: RouterConfig) !*Router(H, ActionArg) {
@@ -712,8 +718,23 @@ pub fn upgradeWebsocket(comptime H: type, req: *Request, res: *Response, ctx: an
     const http_conn = res.conn;
     const ws_worker: *websocket.server.Worker(H) = @ptrCast(@alignCast(http_conn.ws_worker));
 
-    var hc = try ws_worker.createConn(http_conn.stream.handle, http_conn.address, worker.timestamp(0));
-    errdefer ws_worker.cleanupConn(hc);
+    // From here the websocket worker owns the socket and is the one to close
+    // it. Refused once the server is stopping: the connection then ends as an
+    // ordinary one.
+    try http_conn.handOffToWebsocket();
+    // On failure past this point the socket is closed: nothing (not even an
+    // error response) may be written to it, its number may be reused.
+    var hc = ws_worker.createConn(http_conn.stream.handle, http_conn.address, worker.timestamp(0)) catch |err| {
+        // createConn closed the socket.
+        res.written = true;
+        http_conn.abandon();
+        return err;
+    };
+    errdefer {
+        res.written = true;
+        http_conn.abandon();
+        ws_worker.cleanupConn(hc);
+    }
 
     hc.handler = try H.init(&hc.conn, ctx);
 
@@ -736,6 +757,13 @@ pub fn upgradeWebsocket(comptime H: type, req: *Request, res: *Response, ctx: an
         try if (comptime params.len == 1) hc.handler.?.afterInit() else hc.handler.?.afterInit(ctx);
     }
     try ws_worker.setupConnection(hc);
+
+    // Blocking mode: if stopping began during the upgrade, the websocket
+    // worker's shutdown may already have gone through its connections and
+    // missed this one, which would then never end. End it here (closing a
+    // websocket conn twice is harmless).
+    if (http_conn.serverStopping()) return error.ServerStopping;
+
     res.written = true;
     http_conn.handover = .{ .websocket = hc };
     return true;
@@ -1032,6 +1060,102 @@ test "httpz: quick shutdown" {
     server.deinit();
 }
 
+// A request still inside its handler when stop() is called finishes after
+// the event loop has exited, so its connection is left in the handover list
+// for deinit, and its socket must still be closed exactly once. A response
+// that ends the connection leaves the socket for deinit to close; an upgrade
+// hands it to the websocket worker, whose shutdown closes it, so the handler
+// must finish before that shutdown. Closing a socket twice panics on EBADF;
+// never closing it leaves the client waiting on a connection nobody serves.
+const ShutdownGate = struct {
+    entered: std.Thread.ResetEvent = .{},
+    release: std.Thread.ResetEvent = .{},
+
+    const Handler = struct {
+        gate: *ShutdownGate,
+        pub const WebsocketHandler = TestWebsocketHandler.WebsocketHandler;
+
+        fn close(h: Handler, _: *Request, res: *Response) !void {
+            h.gate.entered.set();
+            h.gate.release.wait();
+            res.body = "ok";
+        }
+
+        fn upgrade(h: Handler, req: *Request, res: *Response) !void {
+            h.gate.entered.set();
+            h.gate.release.wait();
+            if (try upgradeWebsocket(WebsocketHandler, req, res, 9001) == false) {
+                res.status = 500;
+            }
+        }
+    };
+
+    fn run(port: u16, http_request: []const u8) !void {
+        var gate = ShutdownGate{};
+        var server = try Server(Handler).init(t.allocator, .{
+            .address = .localhost(port),
+            .workers = .{ .count = 1 },
+        }, .{ .gate = &gate });
+        var router = try server.router(.{});
+        router.get("/close", Handler.close, .{});
+        router.get("/ws", Handler.upgrade, .{});
+        const listen_thread = try server.listenInNewThread();
+        try testing.waitForPort(port);
+
+        const stream = testStream(port);
+        defer stream.close();
+        var writer = stream.writer(&.{});
+        try writer.interface.writeAll(http_request);
+        try writer.interface.flush();
+        try gate.entered.timedWait(2 * std.time.ns_per_s);
+
+        // Stop while the handler is still running, then let it finish: in
+        // non-blocking mode into the handover list after the event loop has
+        // exited; in blocking mode after the websocket worker has shut down.
+        server.stop();
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+        gate.release.set();
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+
+        // A connection nothing will end keeps the listen thread waiting for
+        // ever; fail instead of hanging the run.
+        var joined = std.Thread.ResetEvent{};
+        const joiner = try std.Thread.spawn(.{}, struct {
+            fn join(thread: std.Thread, done: *std.Thread.ResetEvent) void {
+                thread.join();
+                done.set();
+            }
+        }.join, .{ listen_thread, &joined });
+        joined.timedWait(10 * std.time.ns_per_s) catch return error.StopHung;
+        joiner.join();
+        server.deinit();
+
+        // The server is gone, so the client must see its connection end.
+        // recv, not read: on Windows posix.read uses ReadFile, which rejects
+        // sockets opened for overlapped I/O.
+        var buf: [512]u8 = undefined;
+        var timer = try std.time.Timer.start();
+        while (timer.read() < 2 * std.time.ns_per_s) {
+            const n = posix.recv(stream.handle, &buf, 0) catch |err| switch (err) {
+                error.WouldBlock => continue, // testStream's short read timeout
+                error.ConnectionResetByPeer => return,
+                else => return err,
+            };
+            if (n == 0) return;
+        }
+        return error.ConnectionLeftOpen;
+    }
+};
+
+test "httpz: stopping mid-request closes the connection's socket exactly once" {
+    try ShutdownGate.run(5980, "GET /close HTTP/1.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+}
+
+test "httpz: stopping mid-upgrade closes the WebSocket's socket exactly once" {
+    try ShutdownGate.run(5981, "GET /ws HTTP/1.1\r\nContent-Length: 0\r\nupgrade: websocket\r\n" ++
+        "Sec-Websocket-Version: 13\r\nConnection: upgrade\r\nSec-Websocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+}
+
 test "httpz: bind failure releases mutex" {
     // Start a server to occupy the port
     var server1 = try Server(void).init(t.allocator, .{ .address = .localhost(6993) }, {});
@@ -1089,12 +1213,14 @@ test "httpz: a connection that stays open doesn't hold up the ones after it" {
         // Windows takes a DWORD of milliseconds, everything else a timeval.
         const timeout = if (builtin.os.tag == .windows) std.mem.toBytes(@as(u32, 2000)) else std.mem.toBytes(posix.timeval{ .sec = 2, .usec = 0 });
         try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
-        _ = try posix.write(stream.handle, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+        // send/recv go through Winsock; posix.read/write use ReadFile/WriteFile
+        // on Windows, which reject sockets opened for overlapped I/O.
+        _ = try posix.send(stream.handle, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n", 0);
 
         var buf: [256]u8 = undefined;
         var len: usize = 0;
         while (len < buf.len) {
-            const n = posix.read(stream.handle, buf[len..]) catch |err| {
+            const n = posix.recv(stream.handle, buf[len..], 0) catch |err| {
                 std.debug.print("connection {d} after the open one: {}\n", .{ i, err });
                 return err;
             };
@@ -1107,6 +1233,217 @@ test "httpz: a connection that stays open doesn't hold up the ones after it" {
 
 fn testAnswerOk(_: *Request, res: *Response) !void {
     res.body = "ok";
+}
+
+// https://github.com/karlseguin/http.zig/issues/223
+// A handler that's still in-flight when the server is stopped completes after
+// the event loop has exited (run() drains the thread pool on its way out),
+// which puts its conn in handover_list with nothing left to apply the
+// handover. Shutting that list down has to respect the handover, or we close a
+// socket the application already owns (and here, already closed): .BADF, which
+// posix.close treats as unreachable. In blocking mode the disown is refused
+// once stopping, and the connection's own thread closes it.
+test "httpz: disowned connection still in handover at shutdown" {
+    const H = ShutdownDisownHandler;
+    H.in_handler.store(false, .release);
+    H.may_finish.store(false, .release);
+
+    var server = try Server(H).init(t.allocator, .{ .address = .localhost(5983) }, H{});
+    const thrd = try server.listenInNewThread();
+
+    {
+        const stream = testStream(5983);
+        defer stream.close();
+        var writer = stream.writer(&.{});
+        try writer.interface.writeAll("GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+
+        while (H.in_handler.load(.acquire) == false) {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+
+        // The handler is parked inside the request. Stop the server out from
+        // under it, let the event loop exit, then let it finish and disown.
+        server.stop();
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+        H.may_finish.store(true, .release);
+    }
+
+    thrd.join();
+    server.deinit();
+}
+
+const ShutdownDisownHandler = struct {
+    var in_handler: std.atomic.Value(bool) = .init(false);
+    var may_finish: std.atomic.Value(bool) = .init(false);
+
+    pub fn handle(_: ShutdownDisownHandler, _: *Request, res: *Response) void {
+        in_handler.store(true, .release);
+        while (may_finish.load(.acquire) == false) {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+
+        const stream = res.conn.stream;
+        // Fails if stopping already closed the socket (blocking mode on
+        // Windows closes, rather than shuts down, running connections).
+        res.disown() catch return;
+
+        // We're the owner now, so we're the one that closes it. httpz must not
+        // close it again during shutdown.
+        stream.close();
+    }
+};
+
+// The application can close a socket it disowned while the handler is still
+// running. Stopping the server then must leave that socket alone: in blocking
+// mode, listen() shuts down (or, on Windows, closes) the socket of every
+// connection whose thread is still running, and a closed socket fails with
+// EBADF, which posix treats as unreachable.
+test "httpz: stopping leaves alone a socket the application disowned and closed" {
+    const H = DisownedClosedHandler;
+    H.closed.reset();
+    H.may_finish.reset();
+
+    var server = try Server(H).init(t.allocator, .{ .address = .localhost(5986) }, H{});
+    const thrd = try server.listenInNewThread();
+
+    const stream = testStream(5986);
+    defer stream.close();
+    var writer = stream.writer(&.{});
+    try writer.interface.writeAll("GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    try H.closed.timedWait(2 * std.time.ns_per_s);
+
+    server.stop();
+    H.may_finish.set();
+    thrd.join();
+    server.deinit();
+}
+
+const DisownedClosedHandler = struct {
+    var closed: std.Thread.ResetEvent = .{};
+    var may_finish: std.Thread.ResetEvent = .{};
+
+    pub fn handle(_: DisownedClosedHandler, _: *Request, res: *Response) void {
+        const stream = res.conn.stream;
+        res.disown() catch unreachable;
+        stream.close();
+        closed.set();
+        // Still running, so in blocking mode the connection's thread is too.
+        may_finish.wait();
+    }
+};
+
+// Closing a socket removes it from epoll only when no other copy of it is open. A process forked from the server (a handler that
+// starts a child) holds a copy of every open socket until it execs. The server must therefore take a connection out of epoll itself
+// before it closes it: otherwise the registration outlives the connection, and its event points at the freed Conn.
+// `dup` stands in for the forked copy. Covers the parse-error path and the keepalive timeout sweep, on one server.
+test "httpz: a closed connection leaves epoll while another copy of its socket is open" {
+    // The event loop is non-blocking mode's (and dup a POSIX call).
+    if (comptime blockingMode()) return error.SkipZigTest;
+
+    const H = HeldSocketHandler;
+    H.held.store(-1, .release);
+
+    // The 1s keepalive doesn't affect the parse-error case: its second request arrives right after the first response.
+    var server = try Server(H).init(t.allocator, .{ .address = .localhost(5984), .timeout = .{ .keepalive = 1 } }, H{});
+    const thrd = try server.listenInNewThread();
+    defer {
+        server.stop();
+        thrd.join();
+        server.deinit();
+    }
+
+    var buf: [200]u8 = undefined;
+
+    // closed on a parse error
+    {
+        const stream = testStream(5984);
+        var writer = stream.writer(&.{});
+        try writer.interface.writeAll("GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+        _ = testReadAll(stream, &buf);
+        try t.expectEqual(true, H.held.load(.acquire) >= 0);
+
+        // The second request on the same connection does not parse: the server answers 400 and closes its side.
+        try writer.interface.writeAll("TEA HTTP/1.1\r\n\r\n");
+        try t.expectString("HTTP/1.1 400 \r\nConnection: Close\r\nContent-Length: 15\r\n\r\nInvalid Request", testReadAll(stream, &buf));
+
+        // The client hangs up. If the registration is still in epoll, the event for it names a connection that no longer exists.
+        stream.close();
+        std.Thread.sleep(200 * std.time.ns_per_ms);
+        posix.close(H.held.swap(-1, .acq_rel));
+    }
+
+    // closed by the keepalive timeout sweep
+    {
+        const stream = testStream(5984);
+        var writer = stream.writer(&.{});
+        try writer.interface.writeAll("GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+        _ = testReadAll(stream, &buf);
+        try t.expectEqual(true, H.held.load(.acquire) >= 0);
+
+        // The connection idles past its keepalive timeout and the server closes its side, then the client hangs up.
+        std.Thread.sleep(3500 * std.time.ns_per_ms);
+        stream.close();
+        std.Thread.sleep(200 * std.time.ns_per_ms);
+        posix.close(H.held.swap(-1, .acq_rel));
+    }
+}
+
+const HeldSocketHandler = struct {
+    var held: std.atomic.Value(posix.fd_t) = .init(-1);
+
+    pub fn handle(_: HeldSocketHandler, _: *Request, res: *Response) void {
+        held.store(std.c.dup(res.conn.stream.handle), .release);
+        res.status = 200;
+    }
+};
+
+test "httpz: request timeout resets pooled parser state" {
+    if (comptime blockingMode()) return error.SkipZigTest;
+
+    // Force the next client to reuse the timed-out client's HTTPConn.
+    var server = try Server(void).init(t.allocator, .{
+        .address = .localhost(5985),
+        .workers = .{ .count = 1, .min_conn = 1, .max_conn = 1 },
+        .thread_pool = .{ .count = 1 },
+        .timeout = .{ .request = 1, .keepalive = 1 },
+    }, {});
+    var router = try server.router(.{});
+    router.post("/echo", TestDummyHandler.echoBody, .{});
+    const thrd = try server.listenInNewThread();
+    defer {
+        server.stop();
+        thrd.join();
+        server.deinit();
+    }
+
+    const timeout = std.mem.toBytes(posix.timeval{ .sec = 3, .usec = 0 });
+    for ([_][]const u8{
+        "GET /old HTTP/1.1\r\nHost: old\r\n",
+        "POST /echo HTTP/1.1\r\nContent-Length: 8\r\n\r\nab",
+    }) |partial| {
+        {
+            const stream = testStream(5985);
+            defer stream.close();
+            try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
+            var writer = stream.writer(&.{});
+            try writer.interface.writeAll(partial);
+
+            // Wait for the server's timeout close, rather than relying on a sleep.
+            var byte: [1]u8 = undefined;
+            try t.expectEqual(0, try posix.read(stream.handle, &byte));
+        }
+
+        const stream = testStream(5985);
+        defer stream.close();
+        try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
+        var writer = stream.writer(&.{});
+        try writer.interface.writeAll("POST /echo HTTP/1.1\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh");
+
+        var res = testReadParsed(stream);
+        defer res.deinit();
+        try t.expectEqual(200, res.status);
+        try t.expectString("fresh", res.body);
+    }
 }
 
 test "httpz: invalid request" {
@@ -2051,7 +2388,7 @@ test "websocket: upgrade" {
 // Run repeatedly (e.g. zig build test -Dtest-filter="websocket: stress" or run 50x)
 // to verify no race in reader.done() / allocator free when using thread pool.
 test "websocket: stress" {
-    if (force_blocking) return; // non-blocking mode only (thread pool)
+    if (blockingMode()) return; // non-blocking mode only (thread pool)
     const num_clients = 8;
     const messages_per_client = 150;
 
@@ -2118,7 +2455,7 @@ test "websocket: stress" {
 // and after max_conn total WebSocket connections have been opened and closed
 // (cumulative, not concurrent), the worker permanently stops accepting.
 test "websocket: connection counter released on close" {
-    if (force_blocking) return; // non-blocking mode only
+    if (blockingMode()) return; // non-blocking mode only
 
     // Start a dedicated server with a very low max_conn to trigger the bug quickly.
     // Its own port: the shared test servers keep 5992-5999 bound all run.
@@ -2319,6 +2656,11 @@ const TestDummyHandler = struct {
 
     fn fail(_: *Request, _: *Response) !void {
         return error.Failure;
+    }
+
+    fn echoBody(req: *Request, res: *Response) !void {
+        res.status = 200;
+        res.body = req.body() orelse "";
     }
 
     fn reqQuery(req: *Request, res: *Response) !void {
