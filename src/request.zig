@@ -198,7 +198,7 @@ pub const Request = struct {
                 .sec = @intCast(@divTrunc(timeout_ms, 1000)),
                 .usec = @intCast(@mod(timeout_ms, 1000) * 1000),
             });
-            try std.posix.setsockopt(conn.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeval);
+            try @import("worker.zig").setConnectionOption(conn.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeval);
         }
 
         return .{
