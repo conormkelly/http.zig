@@ -2273,6 +2273,9 @@ pub const HTTPConn = struct {
                 },
                 else => return err,
             };
+            // A stream socket never takes none of a non-empty send; were it
+            // to, this loop would spin.
+            if (n == 0) return error.Unexpected;
             while (n > 0) {
                 if (n >= vec[i].len) {
                     n -= vec[i].len;
@@ -2433,9 +2436,12 @@ fn sendNoSignal(socket: posix.socket_t, data: []const u8) SendError!usize {
 /// dead peer is just error.BrokenPipe. (write() and writev() take no flags.)
 /// Darwin sockets also get SO_NOSIGPIPE when accepted (`suppressSigpipe`).
 ///
-/// The errno mapping is posix.sendmsg's, except for EBADF and ENOTSOCK,
-/// which posix.sendmsg treats as unreachable: here they are errors, as
-/// posix.write has EBADF.
+/// Errors: EAGAIN is WouldBlock, EPIPE BrokenPipe, ECONNRESET
+/// ConnectionResetByPeer, ENOTCONN SocketNotConnected, ENOBUFS and ENOMEM
+/// SystemResources, EBADF NotOpenForWriting and ENOTSOCK
+/// FileDescriptorNotASocket. Every other errno is error.Unexpected: nothing
+/// is unreachable, unlike posix.sendmsg, which treats EBADF, ENOTSOCK,
+/// EINVAL, EFAULT and EOPNOTSUPP as unreachable.
 fn sendVecNoSignal(socket: posix.socket_t, vec: []const posix.iovec_const) SendError!usize {
     comptime std.debug.assert(builtin.os.tag != .windows);
     const msg: posix.msghdr_const = .{
@@ -2735,10 +2741,23 @@ test "HTTPConn.writeAllIOVec: writes every part in order across partial sends, s
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
     defer posix.close(pair[1]);
 
-    // Larger than a socket buffer, so the sends are partial.
+    // Non-blocking with a small send buffer: a send takes at most what
+    // fits, so the 1 MB part goes out in many partial sends. (In .blocking
+    // I/O mode, writeAllIOVec retries a WouldBlock rather than switching.)
+    const flags = try posix.fcntl(pair[0], posix.F.GETFL, 0);
+    _ = try posix.fcntl(pair[0], posix.F.SETFL, flags | @as(usize, @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))));
+    try posix.setsockopt(pair[0], posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 8192)));
+
     const big = try t.allocator.alloc(u8, 1024 * 1024);
     defer t.allocator.free(big);
     for (big, 0..) |*b, i| b.* = @truncate(i *% 31);
+
+    // The precondition for partial sends: the buffer is far smaller than
+    // the part.
+    var sndbuf: c_int = 0;
+    var sndbuf_len: posix.socklen_t = @sizeOf(c_int);
+    try t.expectEqual(0, std.c.getsockopt(pair[0], posix.SOL.SOCKET, posix.SO.SNDBUF, @ptrCast(&sndbuf), &sndbuf_len));
+    try t.expectEqual(true, @as(usize, @intCast(sndbuf)) * 4 < big.len);
 
     const Reader = struct {
         fn run(socket: posix.socket_t, out: *std.ArrayList(u8)) void {
