@@ -9,8 +9,8 @@
             .hash = "metrics-0.0.0-W7G4eP2_AQAdJGKMonHeZFaY4oU4ZXPFFTqFCFXItX3O",
         },
         .websocket = .{
-            .url = "https://github.com/conormkelly/websocket.zig/archive/31010783a3cfa85edd6c5d234b06593aa46cb408.tar.gz",
-            .hash = "websocket-0.1.0-ZPISdR9FBACXXosyuCsso22GurIMqF3JEMkpCSPuRO69",
+            .url = "https://github.com/conormkelly/websocket.zig/archive/ede82841b44b903f28a3ae8ee255de92d2554b6b.tar.gz",
+            .hash = "websocket-0.1.0-ZPISdQJGBABFuk9iCSgOvMiX8uF6t5UwMR8aMrBt2cE8",
         },
     },
 }
