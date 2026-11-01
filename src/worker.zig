@@ -193,12 +193,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                     continue;
                 };
                 metrics.connection();
-                suppressSigpipe(socket);
-
-                if (!self.config.isUnixAddress()) {
-                    // Disable Nagle's algorithm to avoid 40-200ms delays on small messages.
-                    posix.setsockopt(socket, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
-                }
+                prepareAccepted(socket, self.config.isUnixAddress());
 
                 self.startConnectionThread(socket, address) catch |err| {
                     log.err("Failed to start a thread for a connection: {}", .{err});
@@ -436,7 +431,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                 if (is_keepalive == false) {
                     deadline = timestamp(0) + to.sec;
                 }
-                try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &to.timeval);
+                try setConnectionOption(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &to.timeval);
             }
 
             var is_first = true;
@@ -498,7 +493,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                             // either way, it's the same code (timeval will just be set to 0 for
                             // the second case)
                             deadline = timestamp(0) + to.sec;
-                            try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &to.timeval);
+                            try setConnectionOption(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &to.timeval);
                         }
                         is_first = false;
                     }
@@ -1039,12 +1034,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                     return if (err == error.WouldBlock) {} else err;
                 };
                 errdefer posix.close(socket);
-                suppressSigpipe(socket);
-
-                if (!self.config.isUnixAddress()) {
-                    // Disable Nagle's algorithm to avoid 40-200ms delays on small messages.
-                    posix.setsockopt(socket, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
-                }
+                prepareAccepted(socket, self.config.isUnixAddress());
 
                 metrics.connection();
 
@@ -2474,25 +2464,47 @@ fn sendVecNoSignal(socket: posix.socket_t, vec: []const posix.iovec_const) SendE
     }
 }
 
+/// Options every accepted socket gets: SO_NOSIGPIPE (Darwin) and, unless
+/// it's a Unix socket, TCP_NODELAY. Best effort: a socket its peer has
+/// already reset just goes on to fail its first read.
+fn prepareAccepted(socket: posix.socket_t, is_unix: bool) void {
+    suppressSigpipe(socket);
+    if (!is_unix) {
+        // Disable Nagle's algorithm to avoid 40-200ms delays on small messages.
+        setConnectionOption(socket, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    }
+}
+
+/// setsockopt on a connection's socket. Darwin fails any setsockopt on a
+/// socket its peer has already reset (one shut down both ways) with EINVAL,
+/// which posix.setsockopt treats as unreachable: a client resetting at the
+/// wrong moment would panic the process. Here that is
+/// error.ConnectionResetByPeer, and EBADF and ENOTSOCK are errors too.
+/// Windows goes through posix.setsockopt, which has no such case.
+pub fn setConnectionOption(socket: posix.socket_t, level: i32, name: u32, value: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) return posix.setsockopt(socket, level, name, value);
+    switch (posix.errno(posix.system.setsockopt(socket, level, name, value.ptr, @intCast(value.len)))) {
+        .SUCCESS => {},
+        .INVAL => return error.ConnectionResetByPeer,
+        .BADF => return error.NotOpenForWriting,
+        .NOTSOCK => return error.FileDescriptorNotASocket,
+        .NOMEM, .NOBUFS => return error.SystemResources,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
 /// Darwin: a write to a dead peer on this socket fails with EPIPE instead of
 /// raising SIGPIPE, whatever call makes it, websocket.zig's sends included
 /// once the socket is handed over. Best effort: the sends pass MSG_NOSIGNAL
 /// regardless. Other systems have no such option (Linux) or no SIGPIPE
 /// (Windows).
-///
-/// Not posix.setsockopt: Darwin fails any setsockopt on a socket whose peer
-/// has already reset it with EINVAL, which posix.setsockopt treats as
-/// unreachable. A client can do that before its connection is accepted.
 fn suppressSigpipe(socket: posix.socket_t) void {
     if (comptime !builtin.os.tag.isDarwin()) return;
-    const one: c_int = 1;
-    const rc = posix.system.setsockopt(socket, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
-    switch (posix.errno(rc)) {
-        .SUCCESS => {},
+    setConnectionOption(socket, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&@as(c_int, 1))) catch |err| switch (err) {
         // Already reset: the next read ends the connection.
-        .INVAL => {},
-        else => |err| log.warn("failed to set SO_NOSIGPIPE: {}", .{err}),
-    }
+        error.ConnectionResetByPeer => {},
+        else => log.warn("failed to set SO_NOSIGPIPE: {}", .{err}),
+    };
 }
 
 const LoopType = enum {
@@ -2764,6 +2776,52 @@ test "writeError: an error response to a closed peer fails instead of raising SI
                 else => return err,
             };
             return error.WriteSucceeded;
+        }
+    }.body);
+    try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
+}
+
+/// A TCP connection whose client reset it before it was accepted: the
+/// server's end.
+fn serverSocketReset() !posix.socket_t {
+    const listener = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(listener);
+    var address = try std.net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(listener, &address.any, address.getOsSockLen());
+    try posix.listen(listener, 1);
+    var len: posix.socklen_t = address.getOsSockLen();
+    try posix.getsockname(listener, &address.any, &len);
+    const client = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    try posix.connect(client, &address.any, address.getOsSockLen());
+    const linger = extern struct { onoff: c_int, linger: c_int }{ .onoff = 1, .linger = 0 };
+    _ = posix.system.setsockopt(client, posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&linger), @sizeOf(@TypeOf(linger)));
+    posix.close(client);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    return posix.accept(listener, null, null, 0);
+}
+
+test "setConnectionOption: a socket its peer has already reset is an error on Darwin, not a panic" {
+    // The request timeouts (Blocking worker, Request.reader) set this way.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const socket = try serverSocketReset();
+    defer posix.close(socket);
+    const timeout = std.mem.toBytes(posix.timeval{ .sec = 1, .usec = 0 });
+    const result = setConnectionOption(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
+    if (comptime builtin.os.tag.isDarwin()) {
+        try t.expectError(error.ConnectionResetByPeer, result);
+    } else {
+        // Linux sets options on a reset socket without complaint.
+        try result;
+    }
+}
+
+test "prepareAccepted: a client that resets before it is accepted is no panic" {
+    // Darwin fails setsockopt on such a socket with EINVAL. A child, so
+    // that a panic fails the test rather than the test run.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const outcome = try runWithDefaultSigpipe(struct {
+        fn body() !void {
+            prepareAccepted(try serverSocketReset(), false);
         }
     }.body);
     try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
