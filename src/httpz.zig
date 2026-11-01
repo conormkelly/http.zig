@@ -1709,6 +1709,44 @@ test "httpz: no route" {
     try t.expectString("HTTP/1.1 404 \r\nContent-Length: 9\r\n\r\nNot Found", testReadAll(stream, &buf));
 }
 
+/// The server's end of the connection `client` made to it: the descriptor
+/// in this process whose peer address is the client's own address.
+fn serverSocketOf(client: posix.socket_t) !posix.socket_t {
+    var local: posix.sockaddr.storage = undefined;
+    var local_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (std.c.getsockname(client, @ptrCast(&local), &local_len) != 0) return error.GetSockName;
+    var fd: posix.socket_t = 0;
+    while (fd < 4096) : (fd += 1) {
+        if (fd == client) continue;
+        var peer: posix.sockaddr.storage = undefined;
+        var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        // Raw: posix.getpeername treats a descriptor that isn't open as unreachable.
+        if (std.c.getpeername(fd, @ptrCast(&peer), &peer_len) != 0) continue;
+        if (peer_len == local_len and std.mem.eql(u8, std.mem.asBytes(&peer)[0..peer_len], std.mem.asBytes(&local)[0..local_len])) return fd;
+    }
+    return error.ServerSocketNotFound;
+}
+
+test "httpz: on Darwin, every socket the server accepts has SO_NOSIGPIPE set" {
+    // Through the real accept path (Blocking or NonBlocking, by build mode).
+    // The answered request means the connection has been accepted.
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const stream = testStream(5992);
+    defer stream.close();
+    var writer = stream.writer(&.{});
+    const w = &writer.interface;
+    try w.writeAll("GET / HTTP/1.1\r\n\r\n");
+    try w.flush();
+    var buf: [100]u8 = undefined;
+    try t.expectString("HTTP/1.1 404 \r\nContent-Length: 9\r\n\r\nNot Found", testReadAll(stream, &buf));
+
+    const server_socket = try serverSocketOf(stream.handle);
+    var value: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    try t.expectEqual(0, std.c.getsockopt(server_socket, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, @ptrCast(&value), &len));
+    try t.expectEqual(true, value != 0);
+}
+
 test "httpz: no route with custom notFound handler" {
     const stream = testStream(5993);
     defer stream.close();

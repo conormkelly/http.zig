@@ -2255,6 +2255,47 @@ pub const HTTPConn = struct {
     }
 
     pub fn writeAllIOVec(self: *HTTPConn, vec: [][]const u8) !void {
+        if (comptime builtin.os.tag == .windows) return self.writeAllIOVecStream(vec);
+
+        // Not std.net.Stream.Writer, though it passes MSG_NOSIGNAL too: it
+        // sends with posix.sendmsg, which treats EBADF and ENOTSOCK as
+        // unreachable. See sendVecNoSignal.
+        var iovecs: [16]posix.iovec_const = undefined;
+        var i: usize = 0;
+        while (true) {
+            while (i < vec.len and vec[i].len == 0) i += 1;
+            if (i == vec.len) return;
+
+            // The OS checks an iovec's pointer before its length, so empty
+            // parts (whose pointer may be anything) are left out.
+            var count: usize = 0;
+            for (vec[i..]) |part| {
+                if (count == iovecs.len) break;
+                if (part.len == 0) continue;
+                iovecs[count] = .{ .base = part.ptr, .len = part.len };
+                count += 1;
+            }
+
+            var n = sendVecNoSignal(self.stream.handle, iovecs[0..count]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    try self.blockingMode();
+                    continue;
+                },
+                else => return err,
+            };
+            while (n > 0) {
+                if (n >= vec[i].len) {
+                    n -= vec[i].len;
+                    i += 1;
+                } else {
+                    vec[i] = vec[i][n..];
+                    n = 0;
+                }
+            }
+        }
+    }
+
+    fn writeAllIOVecStream(self: *HTTPConn, vec: [][]const u8) !void {
         var buf: [4096]u8 = undefined;
         var writer = self.stream.writer(&buf);
         var i: usize = 0;
@@ -2386,26 +2427,32 @@ const SendError = if (builtin.os.tag == .windows) posix.WriteError else error{
     Unexpected,
 };
 
-/// One send that never raises SIGPIPE. A send to a peer that has gone away
-/// raises SIGPIPE unless told not to, and its default action ends the
-/// process: in an application that is a plugin, its host. Whether the host
-/// catches SIGPIPE isn't the library's to know, and a handler installed for
-/// it can be replaced by anything else in the process, so sends pass
-/// MSG_NOSIGNAL and a dead peer is just error.BrokenPipe. (write() takes no
-/// flags.) HTTPConn.writeAllIOVec's std.net.Stream.Writer already sends with
-/// MSG_NOSIGNAL. Darwin sockets also get SO_NOSIGPIPE when accepted
-/// (`suppressSigpipe`). Windows has no SIGPIPE.
-///
-/// The errno mapping is posix.sendmsg's, except that a closed descriptor is
-/// an error, as posix.write has it, rather than unreachable.
+/// One send that never raises SIGPIPE; see sendVecNoSignal. Windows has no
+/// SIGPIPE and sends with posix.write.
 fn sendNoSignal(socket: posix.socket_t, data: []const u8) SendError!usize {
     if (comptime builtin.os.tag == .windows) return posix.write(socket, data);
-    const iov = [_]posix.iovec_const{.{ .base = data.ptr, .len = data.len }};
+    return sendVecNoSignal(socket, &.{.{ .base = data.ptr, .len = data.len }});
+}
+
+/// One send of `vec` (POSIX only) that never raises SIGPIPE. A send to a
+/// peer that has gone away raises SIGPIPE unless the call passes
+/// MSG_NOSIGNAL, and SIGPIPE's default action ends the process: when the
+/// application is a plugin, its host. Whether the host catches SIGPIPE isn't
+/// the library's to know, and a handler installed for it can be replaced by
+/// anything else in the process. So every send passes MSG_NOSIGNAL, and a
+/// dead peer is just error.BrokenPipe. (write() and writev() take no flags.)
+/// Darwin sockets also get SO_NOSIGPIPE when accepted (`suppressSigpipe`).
+///
+/// The errno mapping is posix.sendmsg's, except for EBADF and ENOTSOCK,
+/// which posix.sendmsg treats as unreachable: here they are errors, as
+/// posix.write has EBADF.
+fn sendVecNoSignal(socket: posix.socket_t, vec: []const posix.iovec_const) SendError!usize {
+    comptime std.debug.assert(builtin.os.tag != .windows);
     const msg: posix.msghdr_const = .{
         .name = null,
         .namelen = 0,
-        .iov = &iov,
-        .iovlen = iov.len,
+        .iov = vec.ptr,
+        .iovlen = @intCast(@min(vec.len, posix.IOV_MAX)),
         .control = null,
         .controllen = 0,
         .flags = 0,
@@ -2624,6 +2671,87 @@ test "sendNoSignal: a send to a closed peer fails instead of raising SIGPIPE" {
         }
     }.body);
     try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
+}
+
+/// Only what writeAllIOVec uses: the socket, and an I/O mode that keeps
+/// blockingMode from touching it.
+fn testHTTPConn(socket: posix.socket_t) HTTPConn {
+    var conn: HTTPConn = undefined;
+    conn.stream = .{ .handle = socket };
+    conn._io_mode = .blocking;
+    return conn;
+}
+
+test "HTTPConn.writeAllIOVec: a response to a closed peer fails instead of raising SIGPIPE" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const outcome = try runWithDefaultSigpipe(struct {
+        fn body() !void {
+            var conn = testHTTPConn(try socketToClosedPeer(noPreparation));
+            var vec = [_][]const u8{ "HTTP/1.1 200 \r\n\r\n", "after the peer left" };
+            conn.writeAllIOVec(&vec) catch |err| {
+                if (@as(anyerror, err) == error.BrokenPipe) return;
+                return err;
+            };
+            return error.WriteSucceeded;
+        }
+    }.body);
+    try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
+}
+
+test "HTTPConn.writeAllIOVec: a closed descriptor is an error, not a panic" {
+    // A child, so that a panic fails the test rather than the test run.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const outcome = try runWithDefaultSigpipe(struct {
+        fn body() !void {
+            const socket = try socketToClosedPeer(noPreparation);
+            posix.close(socket);
+            var conn = testHTTPConn(socket);
+            var vec = [_][]const u8{ "HTTP/1.1 200 \r\n\r\n", "body" };
+            conn.writeAllIOVec(&vec) catch |err| {
+                if (@as(anyerror, err) == error.NotOpenForWriting) return;
+                return err;
+            };
+            return error.WriteSucceeded;
+        }
+    }.body);
+    try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
+}
+
+test "HTTPConn.writeAllIOVec: writes every part in order across partial sends, skipping empty ones" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var pair: [2]posix.socket_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
+    defer posix.close(pair[1]);
+
+    // Larger than a socket buffer, so the sends are partial.
+    const big = try t.allocator.alloc(u8, 1024 * 1024);
+    defer t.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 31);
+
+    const Reader = struct {
+        fn run(socket: posix.socket_t, out: *std.ArrayList(u8)) void {
+            var buf: [4096]u8 = undefined;
+            while (true) {
+                const n = posix.read(socket, &buf) catch return;
+                if (n == 0) return;
+                out.appendSlice(t.allocator, buf[0..n]) catch return;
+            }
+        }
+    };
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(t.allocator);
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{ pair[1], &received });
+
+    var conn = testHTTPConn(pair[0]);
+    var vec = [_][]const u8{ "head:", "", big, "", ":tail" };
+    try conn.writeAllIOVec(&vec);
+    posix.close(pair[0]);
+    reader.join();
+
+    try t.expectEqual(5 + big.len + 5, received.items.len);
+    try t.expectString("head:", received.items[0..5]);
+    try t.expectEqual(true, std.mem.eql(u8, big, received.items[5 .. 5 + big.len]));
+    try t.expectString(":tail", received.items[5 + big.len ..]);
 }
 
 test "writeError: an error response to a closed peer fails instead of raising SIGPIPE" {
