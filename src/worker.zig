@@ -193,6 +193,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
                     continue;
                 };
                 metrics.connection();
+                suppressSigpipe(socket);
 
                 if (!self.config.isUnixAddress()) {
                     // Disable Nagle's algorithm to avoid 40-200ms delays on small messages.
@@ -1038,6 +1039,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                     return if (err == error.WouldBlock) {} else err;
                 };
                 errdefer posix.close(socket);
+                suppressSigpipe(socket);
 
                 if (!self.config.isUnixAddress()) {
                     // Disable Nagle's algorithm to avoid 40-200ms delays on small messages.
@@ -2236,7 +2238,7 @@ pub const HTTPConn = struct {
         var blocking = false;
 
         while (i < data.len) {
-            const n = posix.write(socket, data[i..]) catch |err| switch (err) {
+            const n = sendNoSignal(socket, data[i..]) catch |err| switch (err) {
                 error.WouldBlock => {
                     try self.blockingMode();
                     blocking = true;
@@ -2367,8 +2369,82 @@ fn writeError(socket: posix.socket_t, comptime status: u16, comptime msg: []cons
     const response = std.fmt.comptimePrint("HTTP/1.1 {d} \r\nConnection: Close\r\nContent-Length: {d}\r\n\r\n{s}", .{ status, msg.len, msg });
 
     var i: usize = 0;
-    while (i < msg.len) {
-        i += try posix.write(socket, response[i..]);
+    while (i < response.len) {
+        i += try sendNoSignal(socket, response[i..]);
+    }
+}
+
+/// Windows sends as it always has, through posix.write.
+const SendError = if (builtin.os.tag == .windows) posix.WriteError else error{
+    WouldBlock,
+    BrokenPipe,
+    ConnectionResetByPeer,
+    SocketNotConnected,
+    SystemResources,
+    NotOpenForWriting,
+    FileDescriptorNotASocket,
+    Unexpected,
+};
+
+/// One send that never raises SIGPIPE. A send to a peer that has gone away
+/// raises SIGPIPE unless told not to, and its default action ends the
+/// process: in an application that is a plugin, its host. Whether the host
+/// catches SIGPIPE isn't the library's to know, and a handler installed for
+/// it can be replaced by anything else in the process, so sends pass
+/// MSG_NOSIGNAL and a dead peer is just error.BrokenPipe. (write() takes no
+/// flags.) HTTPConn.writeAllIOVec's std.net.Stream.Writer already sends with
+/// MSG_NOSIGNAL. Darwin sockets also get SO_NOSIGPIPE when accepted
+/// (`suppressSigpipe`). Windows has no SIGPIPE.
+///
+/// The errno mapping is posix.sendmsg's, except that a closed descriptor is
+/// an error, as posix.write has it, rather than unreachable.
+fn sendNoSignal(socket: posix.socket_t, data: []const u8) SendError!usize {
+    if (comptime builtin.os.tag == .windows) return posix.write(socket, data);
+    const iov = [_]posix.iovec_const{.{ .base = data.ptr, .len = data.len }};
+    const msg: posix.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &iov,
+        .iovlen = iov.len,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    while (true) {
+        const rc = posix.system.sendmsg(socket, &msg, posix.MSG.NOSIGNAL);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .PIPE => return error.BrokenPipe,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .NOTCONN => return error.SocketNotConnected,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .BADF => return error.NotOpenForWriting,
+            .NOTSOCK => return error.FileDescriptorNotASocket,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+/// Darwin: a write to a dead peer on this socket fails with EPIPE instead of
+/// raising SIGPIPE, whatever call makes it, websocket.zig's sends included
+/// once the socket is handed over. Best effort: the sends pass MSG_NOSIGNAL
+/// regardless. Other systems have no such option (Linux) or no SIGPIPE
+/// (Windows).
+///
+/// Not posix.setsockopt: Darwin fails any setsockopt on a socket whose peer
+/// has already reset it with EINVAL, which posix.setsockopt treats as
+/// unreachable. A client can do that before its connection is accepted.
+fn suppressSigpipe(socket: posix.socket_t) void {
+    if (comptime !builtin.os.tag.isDarwin()) return;
+    const one: c_int = 1;
+    const rc = posix.system.setsockopt(socket, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        // Already reset: the next read ends the connection.
+        .INVAL => {},
+        else => |err| log.warn("failed to set SO_NOSIGPIPE: {}", .{err}),
     }
 }
 
@@ -2485,4 +2561,97 @@ fn expectList(expected: []const i32, list: List(TestNode)) !void {
         prev = node.prev;
     }
     try t.expectEqual(0, i);
+}
+
+// The SIGPIPE tests fork, and in the child put SIGPIPE back to its default
+// action (terminate), as in a host process that doesn't catch it: the test
+// runner is an executable, whose start code catches SIGPIPE.
+const SigpipeOutcome = union(enum) { exited: u8, signaled: u32 };
+
+fn runWithDefaultSigpipe(comptime body: fn () anyerror!void) !SigpipeOutcome {
+    const pid = try posix.fork();
+    if (pid == 0) {
+        const default: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.DFL },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.PIPE, &default, null);
+        body() catch posix.exit(1);
+        posix.exit(0);
+    }
+    const status = posix.waitpid(pid, 0).status;
+    if (posix.W.IFSIGNALED(status)) return .{ .signaled = posix.W.TERMSIG(status) };
+    return .{ .exited = posix.W.EXITSTATUS(status) };
+}
+
+/// One end of a connected pair whose other end is already closed.
+fn socketToClosedPeer(comptime prepare: fn (posix.socket_t) void) !posix.socket_t {
+    var pair: [2]posix.socket_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
+    prepare(pair[0]);
+    posix.close(pair[1]);
+    return pair[0];
+}
+
+fn noPreparation(_: posix.socket_t) void {}
+
+test "a plain write to a closed peer is killed by SIGPIPE under the default action" {
+    // What the tests below guard against, so they can't pass by never
+    // reaching it.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const outcome = try runWithDefaultSigpipe(struct {
+        fn body() !void {
+            const socket = try socketToClosedPeer(noPreparation);
+            _ = try posix.write(socket, "after the peer left");
+            return error.WriteSucceeded;
+        }
+    }.body);
+    try t.expectEqual(SigpipeOutcome{ .signaled = posix.SIG.PIPE }, outcome);
+}
+
+test "sendNoSignal: a send to a closed peer fails instead of raising SIGPIPE" {
+    // HTTPConn.writeAll: response headers and chunks.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const outcome = try runWithDefaultSigpipe(struct {
+        fn body() !void {
+            const socket = try socketToClosedPeer(noPreparation);
+            _ = sendNoSignal(socket, "after the peer left") catch |err| switch (err) {
+                error.BrokenPipe => return,
+                else => return err,
+            };
+            return error.WriteSucceeded;
+        }
+    }.body);
+    try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
+}
+
+test "writeError: an error response to a closed peer fails instead of raising SIGPIPE" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const outcome = try runWithDefaultSigpipe(struct {
+        fn body() !void {
+            const socket = try socketToClosedPeer(noPreparation);
+            writeError(socket, 400, "Invalid Request") catch |err| switch (err) {
+                error.BrokenPipe => return,
+                else => return err,
+            };
+            return error.WriteSucceeded;
+        }
+    }.body);
+    try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
+}
+
+test "suppressSigpipe: on Darwin even a plain write to a closed peer fails instead of raising SIGPIPE" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const outcome = try runWithDefaultSigpipe(struct {
+        fn body() !void {
+            const socket = try socketToClosedPeer(suppressSigpipe);
+            _ = posix.write(socket, "after the peer left") catch |err| switch (err) {
+                error.BrokenPipe => return,
+                else => return err,
+            };
+            return error.WriteSucceeded;
+        }
+    }.body);
+    try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
 }
