@@ -1252,8 +1252,18 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 // is dropped with nothing left to re-arm it, so the
                 // connection would never be read again. Nothing can fire
                 // between the release and the re-arm: the event is disarmed.
+                //
+                // The socket is read before the release, while this thread
+                // still owns the connection: the re-arm hands the connection
+                // to whichever thread the next event lands on, which may
+                // close it and return hc to the pool for the next upgrade.
+                // The kernel orders that event after the re-arm, but
+                // ThreadSanitizer cannot see kqueue (or an epoll MOD) as a
+                // synchronisation point; the processing flag's
+                // release/acquire it can see.
+                const socket = hc.socket;
                 conn.releaseProcessing();
-                self.loop.rearmRead(conn) catch |err| {
+                self.loop.rearmRead(socket, conn) catch |err| {
                     log.debug("({f}) failed to add read event monitor: {}", .{ ws_conn.address, err });
                     // Still disarmed, so no other thread can be processing it.
                     ws_conn.close(.{ .code = 4998, .reason = "wsz" }) catch {};
@@ -1566,10 +1576,10 @@ fn KQueue(comptime WSH: type) type {
             }}, &.{}, null) catch {};
         }
 
-        fn rearmRead(self: *Self, conn: *Conn(WSH)) !void {
+        /// `conn` is only the event's cookie: the caller may no longer own
+        /// it, so it is not dereferenced here.
+        fn rearmRead(self: *Self, socket: posix.fd_t, conn: *Conn(WSH)) !void {
             // called from the worker thread, can't use change_buffer
-            // must remove then re-add for macOS
-            const socket = conn.getSocket();
             _ = try posix.kevent(self.fd, &.{ .{
                 .ident = @intCast(socket),
                 .filter = posix.system.EVFILT.READ,
@@ -1732,16 +1742,18 @@ fn EPoll(comptime WSH: type) type {
             posix.epoll_ctl(self.fd, linux.EPOLL.CTL_DEL, conn.getSocket(), null) catch {};
         }
 
-        fn rearmRead(self: *Self, conn: *Conn(WSH)) !void {
+        /// `conn` is only the event's cookie: the caller may no longer own
+        /// it, so it is not dereferenced here.
+        fn rearmRead(self: *Self, socket: posix.fd_t, conn: *Conn(WSH)) !void {
             var event = linux.epoll_event{
                 .data = .{ .ptr = @intFromPtr(conn) },
                 .events = linux.EPOLL.IN | linux.EPOLL.RDHUP | linux.EPOLL.ONESHOT,
             };
-            return posix.epoll_ctl(self.fd, linux.EPOLL.CTL_MOD, conn.getSocket(), &event);
+            return posix.epoll_ctl(self.fd, linux.EPOLL.CTL_MOD, socket, &event);
         }
 
         fn switchToOneShot(self: *Self, conn: *Conn(WSH)) !void {
-            return self.rearmRead(conn);
+            return self.rearmRead(conn.getSocket(), conn);
         }
 
         fn wait(self: *Self, timeout_sec: ?i32) !Iterator {
