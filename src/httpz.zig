@@ -2789,11 +2789,17 @@ test "websocket: a connection ended from another thread gives its slot back" {
     try testing.waitForPort(E.port);
 
     // With one slot, each upgrade after the first is answered only once the
-    // connection before it has given the slot back.
-    for (0..3) |_| {
+    // connection before it has given the slot back. Every client keeps its
+    // socket open to the end, so only end() can have freed the slot: a
+    // client's own close would free it too.
+    var streams: [3]std.net.Stream = undefined;
+    var opened: usize = 0;
+    defer for (streams[0..opened]) |s| s.close();
+    for (&streams) |*slot| {
         E.conn.store(null, .release);
         const stream = testStream(E.port);
-        defer stream.close();
+        slot.* = stream;
+        opened += 1;
         try stream.writeAll("GET /ws HTTP/1.1\r\nContent-Length: 0\r\nupgrade: websocket\r\n" ++
             "Sec-Websocket-Version: 13\r\nConnection: upgrade\r\nSec-Websocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
         var buf: [512]u8 = undefined;
