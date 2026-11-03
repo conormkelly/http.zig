@@ -262,10 +262,13 @@ fn Worker(comptime F: anytype) type {
                     return args;
                 }
                 self.mutex.lock();
-                if (self.tail == self.head) {
+                // stop() may have run while the lock was released for the
+                // peer check. Its broadcast had no waiter, so waiting now
+                // would wait for a wakeup that has already happened; loop
+                // instead, to take a job that arrived meanwhile or return
+                // null.
+                if (self.tail == self.head and self.stopped == false) {
                     self.read_cond.wait(&self.mutex);
-                } else {
-                    break;
                 }
             }
 
@@ -415,6 +418,69 @@ test "ThreadPool: large fuzz" {
     try t.expectEqual(10_000, testC4);
     try t.expectEqual(10_000, testC5);
     try t.expectEqual(10_000, testC6);
+}
+
+test "ThreadPool: stop reaches a worker that finds its queue empty while it checks its peer" {
+    defer t.reset();
+
+    // With two workers, worker 1's peer is worker 0.
+    var tp = try ThreadPool(testGated).init(t.arena.allocator(), .{ .count = 2, .backlog = 2, .buffer_size = 512 });
+    defer tp.deinit();
+    // Runs before deinit, so an early return can't free the pool under live
+    // threads. A no-op once the pool has stopped.
+    defer tp.stop();
+    const worker = &tp.workers[1];
+    const peer = &tp.workers[0];
+    try t.expectEqual(peer, worker.peer);
+
+    // Park worker 1's thread inside a job (spawnOne sends the first job to
+    // worker 1), so it is not waiting on its read_cond.
+    var gate = TestGate{};
+    tp.spawnOne(.{&gate});
+    gate.started.wait();
+
+    // Holding the peer's lock stalls worker 1 in its peer check once the job
+    // returns: it has seen stopped == false and released its own lock, and
+    // is not yet waiting on its read_cond. The sleep gives it time to get
+    // there; a thread slower than that misses the window and the test passes
+    // without exercising it, but a correct pool passes at any timing.
+    peer.mutex.lock();
+    gate.release.set();
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // stop() signals worker 1 now, while no thread waits on its read_cond.
+    worker.stop();
+    peer.mutex.unlock();
+
+    // Worker 1 must still exit. Stop the pool on another thread so a hang is
+    // a test failure rather than a stuck test run.
+    var stopped = std.Thread.ResetEvent{};
+    const stopper = try std.Thread.spawn(.{}, testStopPool, .{ &tp, &stopped });
+    defer stopper.join();
+    stopped.timedWait(10 * std.time.ns_per_s) catch {
+        // Wake the workers so the pool still shuts down, then fail.
+        while (!stopped.isSet()) {
+            for (tp.workers) |*w| w.read_cond.broadcast();
+            std.Thread.sleep(std.time.ns_per_ms);
+        }
+        return error.WorkerMissedStop;
+    };
+}
+
+const TestGate = struct {
+    started: std.Thread.ResetEvent = .{},
+    release: std.Thread.ResetEvent = .{},
+};
+
+fn testGated(gate: *TestGate, buf: []u8) void {
+    _ = buf;
+    gate.started.set();
+    gate.release.wait();
+}
+
+fn testStopPool(tp: *ThreadPool(testGated), stopped: *std.Thread.ResetEvent) void {
+    tp.stop();
+    stopped.set();
 }
 
 var testSum: u64 = 0;
