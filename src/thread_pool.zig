@@ -264,8 +264,9 @@ fn Worker(comptime F: anytype) type {
                 self.mutex.lock();
                 // stop() may have run while the lock was released for the
                 // peer check. Its broadcast had no waiter, so waiting now
-                // would never end; loop instead, to take a job that arrived
-                // meanwhile or return null.
+                // would wait for a wakeup that has already happened; loop
+                // instead, to take a job that arrived meanwhile or return
+                // null.
                 if (self.tail == self.head and self.stopped == false) {
                     self.read_cond.wait(&self.mutex);
                 }
@@ -425,6 +426,9 @@ test "ThreadPool: stop reaches a worker that finds its queue empty while it chec
     // With two workers, worker 1's peer is worker 0.
     var tp = try ThreadPool(testGated).init(t.arena.allocator(), .{ .count = 2, .backlog = 2, .buffer_size = 512 });
     defer tp.deinit();
+    // Runs before deinit, so an early return can't free the pool under live
+    // threads. A no-op once the pool has stopped.
+    defer tp.stop();
     const worker = &tp.workers[1];
     const peer = &tp.workers[0];
     try t.expectEqual(peer, worker.peer);
@@ -453,10 +457,10 @@ test "ThreadPool: stop reaches a worker that finds its queue empty while it chec
     var stopped = std.Thread.ResetEvent{};
     const stopper = try std.Thread.spawn(.{}, testStopPool, .{ &tp, &stopped });
     defer stopper.join();
-    stopped.timedWait(2 * std.time.ns_per_s) catch {
-        // Wake worker 1 so the pool still shuts down, then fail.
+    stopped.timedWait(10 * std.time.ns_per_s) catch {
+        // Wake the workers so the pool still shuts down, then fail.
         while (!stopped.isSet()) {
-            worker.read_cond.broadcast();
+            for (tp.workers) |*w| w.read_cond.broadcast();
             std.Thread.sleep(std.time.ns_per_ms);
         }
         return error.WorkerMissedStop;
