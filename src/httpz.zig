@@ -2731,6 +2731,84 @@ test "websocket: connection counter released on close" {
     }
 }
 
+// A WebSocket ended by a thread other than its connection's (an
+// application's timer enforcing a deadline) must give its connection slot
+// back: at max_conn the server accepts nothing until one is free.
+const EndFromAnotherThread = struct {
+    const port = 5981;
+    var conn = std.atomic.Value(?*websocket.Conn).init(null);
+
+    const Handler = struct {
+        pub const WebsocketHandler = struct {
+            pub fn init(c: *websocket.Conn, _: u32) !WebsocketHandler {
+                conn.store(c, .release);
+                return .{};
+            }
+            pub fn clientMessage(_: *WebsocketHandler, _: []const u8) !void {}
+        };
+
+        fn upgrade(_: Handler, req: *Request, res: *Response) !void {
+            if (try upgradeWebsocket(WebsocketHandler, req, res, 0) == false) res.status = 500;
+        }
+    };
+
+    /// Reads until `buf` holds `until` (a suffix), the peer closes, or 2 s pass.
+    fn readUntil(stream: std.net.Stream, buf: []u8, until: []const u8) ![]const u8 {
+        var pos: usize = 0;
+        var waited_ms: u32 = 0;
+        while (waited_ms < 2000) {
+            const n = posix.recv(stream.handle, buf[pos..], 0) catch |err| switch (err) {
+                error.WouldBlock => { // the 20 ms receive timeout
+                    waited_ms += 20;
+                    continue;
+                },
+                else => return err,
+            };
+            if (n == 0) return error.EndOfStream;
+            pos += n;
+            if (std.mem.endsWith(u8, buf[0..pos], until)) return buf[0..pos];
+        }
+        return error.Timeout;
+    }
+};
+
+test "websocket: a connection ended from another thread gives its slot back" {
+    const E = EndFromAnotherThread;
+    var server = try Server(E.Handler).init(t.allocator, .{
+        .address = .localhost(E.port),
+        .workers = .{ .count = 1, .min_conn = 1, .max_conn = 1 },
+    }, .{});
+    var router = try server.router(.{});
+    router.get("/ws", E.Handler.upgrade, .{});
+    const listen_thread = try server.listenInNewThread();
+    defer {
+        server.stop();
+        listen_thread.join();
+        server.deinit();
+    }
+    try testing.waitForPort(E.port);
+
+    // With one slot, each upgrade after the first is answered only once the
+    // connection before it has given the slot back.
+    for (0..3) |_| {
+        E.conn.store(null, .release);
+        const stream = testStream(E.port);
+        defer stream.close();
+        try stream.writeAll("GET /ws HTTP/1.1\r\nContent-Length: 0\r\nupgrade: websocket\r\n" ++
+            "Sec-Websocket-Version: 13\r\nConnection: upgrade\r\nSec-Websocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+        var buf: [512]u8 = undefined;
+        const head = try E.readUntil(stream, &buf, "\r\n\r\n");
+        try t.expectEqual(true, std.mem.startsWith(u8, head, "HTTP/1.1 101"));
+
+        const c = E.conn.load(.acquire) orelse return error.HandlerNeverRan;
+        // Let the worker wait on the socket, so nothing but end() wakes it.
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+        try c.end(.{ .code = 4003, .reason = "late" });
+        const frame = try E.readUntil(stream, &buf, "late");
+        try t.expectString(&.{ 136, 6, 0x0f, 0xa3, 'l', 'a', 't', 'e' }, frame);
+    }
+}
+
 test "ContentType: forX" {
     inline for (@typeInfo(ContentType).@"enum".fields) |field| {
         if (comptime std.mem.eql(u8, "BINARY", field.name)) continue;
